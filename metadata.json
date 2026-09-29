@@ -1,0 +1,6 @@
+{
+  "name": "Sistem Pemesanan Cafe Hijau",
+  "description": "Sistem pemesanan menu digital berbasis QR Code untuk cafe bertema hijau dengan dashboard kasir, waiters, dan owner.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

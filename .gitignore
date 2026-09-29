@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+database.sqlite*
+*.backup
+backups/
+logs/
+.wrangler/
+.credentials.local
+.dev.vars
+screenshots/godmode-login.png

@@ -1,0 +1,129 @@
+{
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": [
+        "superpowers@git+https://github.com/obra/superpowers.git"
+    ],
+    "provider": {
+        "9router": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "9Router",
+            "options": {
+                "baseURL": "http://localhost:20128/v1"
+            },
+            "models": {
+                "combo_wombo": {
+                    "name": "Combo Wombo"
+                },
+                "gc/gemini-3.1-pro-preview": {
+                    "name": "Gemini 3.1 Pro Preview"
+                },
+                "gc/gemini-3-pro-preview": {
+                    "name": "Gemini 3 Pro Preview"
+                },
+                "gc/gemini-3-flash-preview": {
+                    "name": "Gemini 3 Flash Preview"
+                },
+                "gc/gemini-2.5-pro": {
+                    "name": "Gemini 2.5 Pro"
+                },
+                "gc/gemini-2.5-flash": {
+                    "name": "Gemini 2.5 Flash"
+                },
+                "gc/gemini-2.5-flash-lite": {
+                    "name": "Gemini 2.5 Flash Lite"
+                },
+                "gc/gemini-3.1-flash-lite-preview": {
+                    "name": "Gemini 3.1 Flash Lite Preview"
+                },
+                "ag/gemini-3-flash-agent": {
+                    "name": "Gemini 3 Flash Agent"
+                },
+                "ag/gemini-3.5-flash-low": {
+                    "name": "Gemini 3.5 Flash Low"
+                },
+                "ag/gemini-3.5-flash-extra-low": {
+                    "name": "Gemini 3.5 Flash Extra Low"
+                },
+                "ag/gemini-pro-agent": {
+                    "name": "Gemini Pro Agent"
+                },
+                "ag/gemini-3.1-pro-low": {
+                    "name": "Gemini 3.1 Pro Low"
+                },
+                "ag/claude-sonnet-4-6": {
+                    "name": "Claude Sonnet 4.6"
+                },
+                "ag/claude-opus-4-6-thinking": {
+                    "name": "Claude Opus 4.6 Thinking"
+                },
+                "ag/gpt-oss-120b-medium": {
+                    "name": "GPT OSS 120B Medium"
+                },
+                "ag/gemini-3-flash": {
+                    "name": "Gemini 3 Flash"
+                },
+                "gh/gpt-5.4-mini-free-auto": {
+                    "name": "GPT 5.4 Mini Free Auto"
+                },
+                "gh/gpt-5.6-luna-free-auto": {
+                    "name": "GPT 5.6 Luna Free Auto"
+                },
+                "gh/gpt-5-mini": {
+                    "name": "GPT 5 Mini"
+                },
+                "gh/gpt-4o": {
+                    "name": "GPT 4o"
+                },
+                "gh/gpt-4o-mini": {
+                    "name": "GPT 4o Mini"
+                },
+                "gh/gpt-4.1": {
+                    "name": "GPT 4.1"
+                },
+                "gh/claude-haiku-4.5": {
+                    "name": "Claude Haiku 4.5"
+                },
+                "gh/mai-code-1-flash": {
+                    "name": "Mai Code 1 Flash"
+                },
+                "gh/copilot-search-a": {
+                    "name": "Copilot Search A"
+                },
+                "gh/copilot-search-b": {
+                    "name": "Copilot Search B"
+                },
+                "gh/copilot-search-c": {
+                    "name": "Copilot Search C"
+                },
+                "gh/exec-agent-a": {
+                    "name": "Exec Agent A"
+                },
+                "gh/exec-agent-b": {
+                    "name": "Exec Agent B"
+                },
+                "gh/exec-agent-c": {
+                    "name": "Exec Agent C"
+                },
+                "gh/mai-code-1-flash-4th": {
+                    "name": "Mai Code 1 Flash 4th"
+                },
+                "gh/mai-code-1-flash-picker": {
+                    "name": "Mai Code 1 Flash Picker"
+                },
+                "gh/mai-code-1-flash-secondary": {
+                    "name": "Mai Code 1 Flash Secondary"
+                },
+                "gh/mai-code-1-flash-tertiary": {
+                    "name": "Mai Code 1 Flash Tertiary"
+                },
+                "gh/trajectory-compaction": {
+                    "name": "Trajectory Compaction"
+                },
+                "gh/oswe-vscode-prime": {
+                    "name": "OSWE VSCode Prime"
+                }
+            }
+        }
+    },
+    "model": "9router/combo_wombo"
+}

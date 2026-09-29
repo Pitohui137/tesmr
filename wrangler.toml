@@ -1,0 +1,18 @@
+name = "salad-yook"
+main = "server/worker.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "dist"
+binding = "ASSETS"
+
+[vars]
+APP_URL = "https://salad-yook.web.id"
+# JWT_SECRET tidak di sini: lokal pakai .dev.vars, produksi pakai wrangler secret
+
+# Ganti database_id dengan hasil `wrangler d1 create salad-yook-db`
+[[d1_databases]]
+binding = "DB"
+database_name = "salad-yook-db"
+database_id = "b2e348e6-ef91-4ba7-abcc-86afca8f58ed"
