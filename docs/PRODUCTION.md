@@ -1,4 +1,4 @@
-# Salad Yook — Panduan Operasional & Maintenance
+# Mepet-Rumah — Panduan Operasional & Maintenance
 
 Dokumen ini untuk pemilik/admin. Simpan di tempat aman.
 
@@ -60,7 +60,7 @@ Kembali ke deployment sebelumnya secara instan.
 # Backup dulu data saat ini
 npm run backup:d1
 # Restore
-npx wrangler d1 execute salad-yook-db --remote --file=backups/d1-<tanggal>.sql
+npx wrangler d1 execute mepetrumah-db --remote --file=backups/d1-<tanggal>.sql
 ```
 
 ## Maintenance Rutin

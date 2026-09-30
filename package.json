@@ -1,5 +1,5 @@
 {
-  "name": "salad-yook",
+  "name": "mepet-rumah",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -15,7 +15,7 @@
     "backup:users": "bash scripts/backup-users.sh",
     "reset:orders": "bash scripts/reset-orders.sh",
     "screenshots": "node scripts/capture-screenshots.mjs",
-    "d1:init": "wrangler d1 execute salad-yook-db --local --file=server/schema.sql && wrangler d1 execute salad-yook-db --local --file=server/seed.sql",
+    "d1:init": "wrangler d1 execute mepetrumah-db --local --file=server/schema.sql && wrangler d1 execute mepetrumah-db --local --file=server/seed.sql",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },

@@ -12,11 +12,11 @@ npm run deploy:prod        # = bash scripts/deploy-cloudflare.sh
 ```
 Script otomatis:
 1. Build frontend + server
-2. Buat/ambil D1 `salad-yook-db` + isi `database_id` di `wrangler.toml`
+2. Buat/ambil D1 `mepetrumah-db` + isi `database_id` di `wrangler.toml`
 3. Jalankan schema + migrasi ke D1 **remote** (tabel `orders.additional_amount`, `daily_stats` mobile/desktop/tablet/bot, `app_logs`)
 4. Pastikan akun admin (`admin`) ada
 5. Set `JWT_SECRET` acak via `wrangler secret put` (jika belum)
-6. `wrangler deploy` → tampilkan URL `https://salad-yook.<subdomain>.workers.dev`
+6. `wrangler deploy` → tampilkan URL `https://mepet-rumah.<subdomain>.workers.dev`
 
 ## C. Setelah Deploy (WAJIB)
 - [ ] Login `admin` di `https://<url>/godmode` → **ganti password** admin
@@ -26,7 +26,7 @@ Script otomatis:
 
 ## D. Ganti APP_URL (biar akurat di Wrangler Info)
 `APP_URL` di `wrangler.toml` `[vars]` masih `http://localhost:8787`. Ini hanya info/tampilan (QR meja otomatis memakai alamat asli), tapi sebaiknya dirapikan:
-1. Edit `wrangler.toml` → `[vars] APP_URL = "https://salad-yook.<subdomain>.workers.dev"`
+1. Edit `wrangler.toml` → `[vars] APP_URL = "https://mepet-rumah.<subdomain>.workers.dev"`
 2. Re-deploy: `npm run deploy:prod`
 > Setelah punya domain, ganti ke domain asli lalu deploy ulang.
 
@@ -49,7 +49,7 @@ Script otomatis:
 2. `npx wrangler tail` (log live)
 3. Dashboard Cloudflare → D1 → Console → SQL perbaikan data
 4. `npx wrangler rollback` → balik ke versi sebelumnya
-5. Restore backup: `npx wrangler d1 execute salad-yook-db --remote --file=backups/d1-<tanggal>.sql`
+5. Restore backup: `npx wrangler d1 execute mepetrumah-db --remote --file=backups/d1-<tanggal>.sql`
 
 ## H. Catatan Penting
 - Crash `wrangler dev` yang pernah terjadi adalah **bug emulator lokal (miniflare)** di mesin ini — **tidak terjadi di produksi**.

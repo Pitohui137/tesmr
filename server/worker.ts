@@ -277,7 +277,7 @@ async function getSettingsCached(db: D1Database): Promise<any> {
         name: row.name, address: row.address, phone: row.phone,
         qrisMerchantName: row.qris_merchant_name, qrisCodeText: row.qris_code_text, qrisImageUrl: row.qris_image_url,
       }
-    : { name: 'Salad Yook', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '' };
+    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '' };
   settingsCache.ts = Date.now();
   return settingsCache.data;
 }
@@ -477,7 +477,7 @@ app.post('/api/auth/login', loginLimiter, async (c) => {
   if (!username || !password) return c.json({ error: 'Username dan password harus diisi' }, 400);
 
   const isLocal = c.req.url.includes('localhost') || c.req.url.includes('127.0.0.1');
-  if (!isLocal && c.env.JWT_SECRET === 'salad-yook-dev-secret-ganti-di-produksi') {
+  if (!isLocal && c.env.JWT_SECRET === 'mepet-rumah-dev-secret-ganti-di-produksi') {
     return c.json({ error: 'Server belum dikonfigurasi dengan benar (JWT_SECRET masih default). Jalankan: bash scripts/deploy-cloudflare.sh' }, 500);
   }
 
@@ -985,10 +985,10 @@ app.get('/api/stats', auth, requireRole('admin'), async (c) => {
 app.get('/api/info', auth, requireRole('admin'), async (c) => {
   const cf = (c.req.raw as any).cf || {};
   const maskSecret = (v?: string) =>
-    !v ? 'BELUM DISET' : (v === 'salad-yook-dev-secret-ganti-di-produksi' ? 'DEFAULT (belum diganti!)' : 'Tersimpan (aman)');
+    !v ? 'BELUM DISET' : (v === 'mepet-rumah-dev-secret-ganti-di-produksi' ? 'DEFAULT (belum diganti!)' : 'Tersimpan (aman)');
   return c.json({
-    app: { name: 'salad-yook', main: 'server/worker.ts', version: APP_VERSION, compatibilityDate: '2025-01-01' },
-    bindings: ['DB (D1: salad-yook-db)', 'ASSETS (statis)'],
+    app: { name: 'mepet-rumah', main: 'server/worker.ts', version: APP_VERSION, compatibilityDate: '2025-01-01' },
+    bindings: ['DB (D1: mepetrumah-db)', 'ASSETS (statis)'],
     env: {
       APP_URL: (c.env as any).APP_URL || '(kosong)',
       JWT_SECRET: maskSecret(c.env.JWT_SECRET),

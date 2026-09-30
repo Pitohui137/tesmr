@@ -1,10 +1,10 @@
--- Skema database D1 untuk Salad Yook
--- Jalankan: wrangler d1 execute salad-yook-db --local --file=server/schema.sql (lokal)
---           wrangler d1 execute salad-yook-db --file=server/schema.sql (remote)
+-- Skema database D1 untuk Mepet-Rumah
+-- Jalankan: wrangler d1 execute mepetrumah-db --local --file=server/schema.sql (lokal)
+--           wrangler d1 execute mepetrumah-db --file=server/schema.sql (remote)
 
 CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  name TEXT NOT NULL DEFAULT 'Salad Yook',
+  name TEXT NOT NULL DEFAULT 'Mepet-Rumah',
   address TEXT NOT NULL DEFAULT '',
   phone TEXT NOT NULL DEFAULT '',
   qris_merchant_name TEXT NOT NULL DEFAULT '',

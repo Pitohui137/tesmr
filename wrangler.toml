@@ -1,4 +1,4 @@
-name = "salad-yook"
+name = "mepet-rumah"
 main = "server/worker.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -8,11 +8,11 @@ directory = "dist"
 binding = "ASSETS"
 
 [vars]
-APP_URL = "https://salad-yook.web.id"
+APP_URL = "https://mepet-rumah.mepetrumah.workers.dev"
 # JWT_SECRET tidak di sini: lokal pakai .dev.vars, produksi pakai wrangler secret
 
-# Ganti database_id dengan hasil `wrangler d1 create salad-yook-db`
+# Ganti database_id dengan hasil `wrangler d1 create mepetrumah-db`
 [[d1_databases]]
 binding = "DB"
-database_name = "salad-yook-db"
-database_id = "b2e348e6-ef91-4ba7-abcc-86afca8f58ed"
+database_name = "mepetrumah-db"
+database_id = "d193b5f8-2368-4edd-87cf-f72e8e544816"

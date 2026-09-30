@@ -557,7 +557,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
           <div className="absolute inset-0 bg-gradient-to-b from-brand-forest/20 to-transparent" />
           <div className="relative z-10 flex flex-col items-center">
             <div className="mb-4 w-20 h-20 rounded-full overflow-hidden ring-2 ring-white/15 shadow-xl">
-              <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+              <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
             </div>
             <h1 className="text-xl font-black tracking-tight text-white drop-shadow-lg">{settings.name}</h1>
             <p className="text-[10px] uppercase tracking-[0.15em] text-brand-light-sage mt-0.5 font-semibold opacity-80">{portalLabel || 'Management Suite'}</p>
@@ -1190,7 +1190,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                     value={cafeName}
                     onChange={(e) => setCafeName(e.target.value)}
                     className="w-full px-4 py-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-800"
-                    placeholder="cth: Salad Yook"
+                    placeholder="cth: Mepet-Rumah"
                   />
                 </div>
 
@@ -1223,7 +1223,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                     value={qrisMerchant}
                     onChange={(e) => setQrisMerchant(e.target.value)}
                     className="w-full px-4 py-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-800"
-                    placeholder="SALAD YOOK"
+                    placeholder="MEPET RUMAH"
                   />
                 </div>
 

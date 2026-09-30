@@ -1,5 +1,5 @@
--- Seed data awal Salad Yook
--- Jalankan setelah schema: wrangler d1 execute salad-yook-db --local --file=server/seed.sql
+-- Seed data awal Mepet-Rumah
+-- Jalankan setelah schema: wrangler d1 execute mepetrumah-db --local --file=server/seed.sql
 
 INSERT
     OR IGNORE INTO settings (
@@ -12,10 +12,10 @@ INSERT
     )
 VALUES (
         1,
-        'Salad Yook',
+        'Mepet-Rumah',
         'Jl. Pemuda No. 34, Majalengka Kulon, Kec. Majalengka, Kabupaten Majalengka',
         '0812-3456-7890',
-        'SALAD YOOK',
+        'MEPET RUMAH',
         ''
     );
 
@@ -58,7 +58,7 @@ VALUES (
         datetime('now')
     );
 
--- Menu baru sesuai MENU SALADYOOK (gambar menyusul, image_url kosong)
+-- Menu baru sesuai MENU MEPET-RUMAH (gambar menyusul, image_url kosong)
 DELETE FROM menu;
 
 INSERT INTO menu (id, name, category, price, description, image_url, is_available, variants, created_at) VALUES

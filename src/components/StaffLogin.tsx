@@ -61,7 +61,7 @@ export default function StaffLogin({ onLoginSuccess, requiredRole, portalLabel }
           <div className="absolute inset-0 bg-black/10" />
           <div className="relative z-10">
             <div className="mx-auto mb-4 w-20 h-20 rounded-full overflow-hidden ring-2 ring-white/15 shadow-xl">
-              <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+              <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
             </div>
             <h2 className="text-xl font-black text-white tracking-tight drop-shadow-lg">{portalLabel || 'Portal Staf Cafe'}</h2>
             <p className="text-brand-light-sage text-xs mt-0.5 font-medium opacity-80">
@@ -140,7 +140,7 @@ export default function StaffLogin({ onLoginSuccess, requiredRole, portalLabel }
         )}
       </div>
 
-      <p className="text-[10px] text-slate-400 mt-4">© {new Date().getFullYear()} Salad Yook — Semua hak cipta dilindungi.</p>
+      <p className="text-[10px] text-slate-400 mt-4">© {new Date().getFullYear()} Mepet-Rumah — Semua hak cipta dilindungi.</p>
     </div>
   );
 }

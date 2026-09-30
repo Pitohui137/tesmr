@@ -279,11 +279,11 @@ function cachedJson(req: express.Request, res: express.Response, data: any) {
 const SALT_ROUNDS = 10;
 
 const defaultSettings: CafeSettings = {
-  name: "Salad Yook",
+  name: "Mepet-Rumah",
   address: "Jl. Pemuda No. 34, Majalengka Kulon, Kec. Majalengka, Kabupaten Majalengka",
   phone: "0812-3456-7890",
-  qrisMerchantName: "SALAD YOOK",
-  qrisCodeText: "00020101021226590016ID1020304050607080215ID1234567890123520459995303360540510.005802ID5923SALAD YOOK6007BANDUNG61054011562070703A016304A7B8"
+  qrisMerchantName: "MEPET RUMAH",
+  qrisCodeText: "00020101021226590016ID1020304050607080215ID1234567890123520459995303360540510.005802ID5923MEPET RUMAH6007BANDUNG61054011562070703A016304A7B8"
 };
 
 const hashPassword = (password: string) => bcrypt.hashSync(password, SALT_ROUNDS);
@@ -1350,9 +1350,9 @@ app.get('/api/stats', authMiddleware, requireRole('admin'), (req, res) => {
 // Info server (khusus admin / godmode)
 app.get('/api/info', authMiddleware, requireRole('admin'), (req, res) => {
   const maskSecret = (v?: string) =>
-    !v ? 'BELUM DISET' : (v === 'salad-yook-dev-secret-ganti-di-produksi' ? 'DEFAULT (belum diganti!)' : 'Tersimpan (aman)');
+    !v ? 'BELUM DISET' : (v === 'mepet-rumah-dev-secret-ganti-di-produksi' ? 'DEFAULT (belum diganti!)' : 'Tersimpan (aman)');
   res.json({
-    app: { name: 'salad-yook (Express)', version: '1.0.0', node: process.version, platform: process.platform, arch: process.arch },
+    app: { name: 'mepet-rumah (Express)', version: '1.0.0', node: process.version, platform: process.platform, arch: process.arch },
     env: { APP_URL: process.env.APP_URL || '(kosong)', JWT_SECRET: maskSecret(JWT_SECRET) },
     serverTime: new Date().toISOString(),
     uptimeSec: Math.round(process.uptime()),

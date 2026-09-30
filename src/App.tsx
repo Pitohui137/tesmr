@@ -110,14 +110,14 @@ export default function App() {
               <div className="relative w-32 h-32 mx-auto">
                 <div className="absolute inset-0 bg-brand-forest/40 rounded-full blur-3xl scale-150" />
                 <div className="relative w-32 h-32 rounded-full overflow-hidden ring-4 ring-white/20 shadow-2xl">
-                  <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+                  <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
                 </div>
               </div>
             </div>
             <Sparkles className="absolute -top-2 -right-2 text-yellow-400 animate-bounce" size={24} />
           </div>
           <div>
-            <h2 className="text-3xl font-black tracking-tight text-white drop-shadow-lg">Salad Yook</h2>
+            <h2 className="text-3xl font-black tracking-tight text-white drop-shadow-lg">Mepet-Rumah</h2>
             <p className="text-brand-light-sage text-xs mt-3 uppercase tracking-[0.2em] font-bold opacity-80">Menyiapkan Menu...</p>
           </div>
           <RefreshCw className="animate-spin text-brand-sage mx-auto" size={20} />
@@ -132,10 +132,10 @@ export default function App() {
         <div className="text-center space-y-4 max-w-sm">
           <div className="mx-auto mb-4">
             <div className="w-20 h-20 rounded-full overflow-hidden ring-2 ring-white/15 mx-auto">
-              <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+              <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
             </div>
           </div>
-          <h2 className="text-2xl font-bold tracking-tight text-white">Salad Yook</h2>
+          <h2 className="text-2xl font-bold tracking-tight text-white">Mepet-Rumah</h2>
           <p className="text-sm text-red-300">{loadError}</p>
           <button
             onClick={() => { setIsLoading(true); setLoadError(''); fetchInitialData(); }}
@@ -149,7 +149,7 @@ export default function App() {
   }
 
   const fallbackSettings: CafeSettings = settings || {
-    name: 'Salad Yook', address: '', phone: '', qrisMerchantName: '', qrisCodeText: ''
+    name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: ''
   };
 
   // Godmode portal (khusus akun admin)

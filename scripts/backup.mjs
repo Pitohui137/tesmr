@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Backup & Restore SQLite untuk Salad Yook
+// Backup & Restore SQLite untuk Mepet-Rumah
 // Usage:
 //   node scripts/backup.mjs            -> buat backup manual
 //   node scripts/backup.mjs list       -> daftar backup tersedia

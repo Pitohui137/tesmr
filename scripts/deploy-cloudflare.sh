@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy Salad Yook ke Cloudflare Workers + D1.
+# Deploy Mepet-Rumah ke Cloudflare Workers + D1.
 #   - Membuat D1 jika belum ada + mengisi database_id di wrangler.toml
 #   - Menjalankan schema + migrasi ke D1 REMOTE (aman untuk DB lama & baru)
 #   - Memasang JWT_SECRET acak (kalau belum ada) via wrangler secret put
@@ -7,7 +7,7 @@
 # Pemakaian: bash scripts/deploy-cloudflare.sh
 set -euo pipefail
 
-DB_NAME="salad-yook-db"
+DB_NAME="mepetrumah-db"
 TOML="wrangler.toml"
 
 echo "=== 1/6 Cek login wrangler ==="
@@ -112,10 +112,10 @@ npx wrangler deploy
 echo "=== 7/7 JWT_SECRET (secret produksi) ==="
 if ! npx wrangler secret list --json 2>/dev/null | grep -q '"JWT_SECRET"'; then
   SECRET=$(openssl rand -base64 32)
-  printf '{"JWT_SECRET":"%s"}\n' "$SECRET" > /tmp/salad-secret.json
+  printf '{"JWT_SECRET":"%s"}\n' "$SECRET" > /tmp/mepet-rumah-secret.json
   echo "  Memasang JWT_SECRET acak..."
-  npx wrangler secret bulk /tmp/salad-secret.json
-  rm -f /tmp/salad-secret.json
+  npx wrangler secret bulk /tmp/mepet-rumah-secret.json
+  rm -f /tmp/mepet-rumah-secret.json
 else
   echo "  JWT_SECRET sudah terpasang."
 fi
@@ -124,7 +124,7 @@ echo ""
 echo "=================================================="
 echo "✅ Deploy selesai."
 echo "   URL sementara (gratis, tanpa domain):"
-echo "   https://salad-yook.<subdomain>.workers.dev"
+echo "   https://mepet-rumah.<subdomain>.workers.dev"
 echo "   (cek output wrangler deploy untuk URL persisnya)"
 echo ""
 echo "   LANGKAH BERIKUTNYA (WAJIB):"

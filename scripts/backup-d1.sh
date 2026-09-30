@@ -4,7 +4,7 @@
 # Pemakaian: bash scripts/backup-d1.sh
 set -euo pipefail
 
-DB_NAME="salad-yook-db"
+DB_NAME="mepetrumah-db"
 BACKUP_DIR="backups"
 MAX_BACKUPS=14
 

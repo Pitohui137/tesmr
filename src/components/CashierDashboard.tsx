@@ -357,7 +357,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
       <header className="bg-brand-deep text-white px-6 py-4 shadow-md flex justify-between items-center z-10">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-full overflow-hidden ring-2 ring-white/10 shadow-md shrink-0">
-            <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+            <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
           </div>
           <div>
             <h1 className="font-extrabold text-base tracking-tight leading-none text-white">{settings.name}</h1>

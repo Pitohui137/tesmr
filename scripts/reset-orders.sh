@@ -14,7 +14,7 @@
 # ============================================================
 set -euo pipefail
 
-DB_NAME="salad-yook-db"
+DB_NAME="mepetrumah-db"
 FORCE=0
 HARD=0
 for a in "$@"; do

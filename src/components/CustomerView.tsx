@@ -380,7 +380,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
             <div className="absolute -top-10 -right-10 w-40 h-40 bg-brand-forest/30 rounded-full blur-3xl" />
             <div className="relative z-10">
               <div className="mx-auto mb-5 w-24 h-24 rounded-full overflow-hidden ring-3 ring-white/20 shadow-2xl">
-                <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+                <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
               </div>
               <span className="inline-block px-4 py-1.5 bg-white/10 text-brand-light-sage rounded-full text-[10px] font-bold uppercase tracking-[0.15em] mb-3 border border-white/10 backdrop-blur-sm">
                 Scan Meja Berhasil
@@ -476,7 +476,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="w-9 h-9 rounded-full overflow-hidden ring-2 ring-white/10">
-                  <img src="/logo.png" alt="Salad Yook" className="w-full h-full object-cover" />
+                  <img src="/logo.png" alt="Mepet-Rumah" className="w-full h-full object-cover" />
                 </div>
                 <h1 className="text-lg font-black tracking-tight">{settings.name}</h1>
               </div>

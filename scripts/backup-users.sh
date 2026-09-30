@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Backup khusus tabel users (akun staf: owner/kasir/admin/tambahan) dari D1 REMOTE.
 # Pemakaian: bash scripts/backup-users.sh
-# RESTORE: npx wrangler d1 execute salad-yook-db --remote --file="backups/users-XXXX.sql"
+# RESTORE: npx wrangler d1 execute mepetrumah-db --remote --file="backups/users-XXXX.sql"
 set -euo pipefail
 
-DB_NAME="salad-yook-db"
+DB_NAME="mepetrumah-db"
 BACKUP_DIR="backups"
 mkdir -p "$BACKUP_DIR"
 
@@ -20,8 +20,8 @@ rows = json.load(open(sys.argv[1]))[0]['results']
 out = sys.argv[2]
 cols = ['id','username','name','role','email','password','created_at']
 with open(out, 'w') as f:
-    f.write("-- Backup akun (users) Salad Yook\n")
-    f.write("-- RESTORE: npx wrangler d1 execute salad-yook-db --remote --file=\"" + out + "\"\n\n")
+    f.write("-- Backup akun (users) Mepet-Rumah\n")
+    f.write("-- RESTORE: npx wrangler d1 execute mepetrumah-db --remote --file=\"" + out + "\"\n\n")
     for r in rows:
         vals = ", ".join("'" + str(r[c] or '').replace("'", "''") + "'" for c in cols)
         f.write(f"INSERT OR REPLACE INTO users ({', '.join(cols)}) VALUES ({vals});\n")

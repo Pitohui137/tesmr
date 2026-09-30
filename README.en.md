@@ -1,16 +1,16 @@
 <p align="center">
-  <img src="assets/logo-large.png" alt="Salad Yook" width="180" />
+  <img src="assets/logo-large.png" alt="Mepet-Rumah" width="180" />
 </p>
 
-<h1 align="center">🌿 Salad Yook — Cafe Ordering System (QR Self-Order)</h1>
+<h1 align="center">🌿 Mepet-Rumah — Cafe Ordering System (QR Self-Order)</h1>
 
 <p align="center">
   <a href="README.md">🇮🇩 Indonesia</a> · <strong>🇬🇧 English</strong>
 </p>
 
 <p align="center">
-  <a href="https://salad-yook.web.id" target="_blank" rel="noopener">
-    <img alt="View Live" src="https://img.shields.io/badge/View%20Live-salad--yook.web.id-2d5a27?style=for-the-badge" />
+  <a href="https://mepet-rumah.web.id" target="_blank" rel="noopener">
+    <img alt="View Live" src="https://img.shields.io/badge/View%20Live-mepet--rumah.web.id-2d5a27?style=for-the-badge" />
   </a>
 </p>
 
