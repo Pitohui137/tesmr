@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload } from 'lucide-react';
+import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload, Clock } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 import { compressImage } from '../utils/image';
+import { estimateMinutes, formatClock } from '../utils/estimate';
 
 const CATEGORY_LABELS: Record<string, string> = {
   makanan: 'Food Menu',
@@ -73,6 +74,13 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   const [addItemsMessage, setAddItemsMessage] = useState<string>('');
   const checkoutInFlightRef = useRef(false);
   const addItemsInFlightRef = useRef(false);
+
+  // Detak tiap 30 detik agar hitung mundur estimasi tampil segar
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
 
   // Upload bukti bayar QRIS
   const [proofUploading, setProofUploading] = useState(false);
@@ -196,6 +204,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
       return sum + itemPriceOf(key) * (qty as number);
     }, 0);
   };
+
+  const getCartEstimate = () =>
+    estimateMinutes(
+      Object.entries(cart).map(([key, qty]) => ({ menuId: key.split('::')[0], quantity: qty as number })),
+      menu
+    );
 
   const getCartItemCount = () => {
     return Object.values(cart).reduce((sum, qty) => (sum as number) + (qty as number), 0) as number;
@@ -880,6 +894,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     <span className="text-slate-500 font-semibold text-sm">Total Pembayaran</span>
                     <span className="text-xl font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
                   </div>
+                  {getCartEstimate() > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-500 -mt-2 mb-4">
+                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
+                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
+                    </div>
+                  )}
 
                   {error && (
                     <div className="mb-3 p-3 bg-red-50 border border-red-100 text-red-700 rounded-xl text-xs flex items-center gap-2">
@@ -959,6 +979,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     <span className="text-slate-500 font-bold text-sm">Total Pembayaran</span>
                     <span className="text-lg font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
                   </div>
+                  {getCartEstimate() > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-500">
+                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
+                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="p-4 bg-slate-50 flex gap-2">
@@ -1030,6 +1056,36 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
         {currentOrder.status !== 'dibatalkan' && (
           <div className="p-6 border-b border-slate-100 bg-brand-badge-bg/10">
             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Status Pesanan Anda</h3>
+
+            {(currentOrder.status === 'menunggu_verifikasi' || currentOrder.status === 'diproses') && (() => {
+              const mins = estimateMinutes(currentOrder.items, menu);
+              if (mins <= 0) return null;
+              const readyAt = currentOrder.status === 'diproses' && currentOrder.processedAt
+                ? new Date(currentOrder.processedAt).getTime() + mins * 60000
+                : null;
+              const remaining = readyAt ? Math.max(0, Math.ceil((readyAt - nowTick) / 60000)) : null;
+              return (
+                <div className="mb-5 flex items-start gap-2.5 bg-white border border-brand-badge-border rounded-xl p-3">
+                  <Clock size={16} className="text-brand-forest flex-shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    {readyAt ? (
+                      <p className="text-sm font-extrabold text-brand-deep">
+                        {remaining && remaining > 0
+                          ? `Perkiraan siap pukul ${formatClock(readyAt)} (±${remaining} menit lagi)`
+                          : 'Pesanan Anda sebentar lagi siap'}
+                      </p>
+                    ) : (
+                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{mins} menit</p>
+                    )}
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      {readyAt
+                        ? `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`
+                        : 'Dihitung sejak pembayaran Anda diverifikasi kasir.'}
+                    </p>
+                  </div>
+                </div>
+              );
+            })()}
 
             <div className="space-y-6 relative before:absolute before:left-[15px] before:top-4 before:bottom-4 before:w-[2px] before:bg-slate-200">
               {/* Step 1: Verification */}

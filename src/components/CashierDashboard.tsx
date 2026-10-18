@@ -4,6 +4,7 @@ import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSoun
 import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
+import { estimateMinutes, formatClock } from '../utils/estimate';
 
 interface CashierDashboardProps {
   settings: CafeSettings;
@@ -778,6 +779,25 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span className="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Total Tagihan</span>
                       <span className="text-sm font-extrabold text-brand-deep">{formatPrice(order.totalPrice)}</span>
                     </div>
+
+                    {(order.status === 'menunggu_verifikasi' || order.status === 'diproses') && (() => {
+                      const mins = estimateMinutes(order.items, menuItems);
+                      if (mins <= 0) return null;
+                      const readyAt = order.status === 'diproses' && order.processedAt
+                        ? new Date(order.processedAt).getTime() + mins * 60000
+                        : null;
+                      const late = readyAt !== null && Date.now() > readyAt;
+                      return (
+                        <div className={`flex justify-between items-center text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
+                          <span className="flex items-center gap-1"><Clock size={12} /> Est. {mins} menit</span>
+                          <span>
+                            {readyAt
+                              ? (late ? `Lewat target ${formatClock(readyAt)}` : `Target siap ${formatClock(readyAt)}`)
+                              : 'Mulai dihitung setelah dikonfirmasi'}
+                          </span>
+                        </div>
+                      );
+                    })()}
 
                     {order.paymentMethod === 'qris' && (
                       order.hasPaymentProof ? (

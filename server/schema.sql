@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL,
   additional_amount INTEGER NOT NULL DEFAULT 0,
   has_payment_proof INTEGER NOT NULL DEFAULT 0,
+  processed_at TEXT,
   archived_at TEXT,
   created_at TEXT NOT NULL
 );

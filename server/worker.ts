@@ -75,6 +75,7 @@ interface OrderRow {
   additional_amount?: number;
   archived_at?: string | null;
   has_payment_proof?: number;
+  processed_at?: string | null;
   created_at: string;
 }
 
@@ -228,6 +229,7 @@ function toOrder(o: OrderRow) {
     additionalAmount: o.additional_amount || 0,
     archivedAt: o.archived_at || undefined,
     hasPaymentProof: !!o.has_payment_proof,
+    processedAt: o.processed_at || undefined,
   };
 }
 
@@ -804,7 +806,8 @@ app.put('/api/orders/:id/status', auth, requireRole('owner', 'kasir'), async (c)
     return c.json({ error: `Transisi status tidak valid: ${order.status} -> ${status}` }, 400);
   }
   const additionalAmount = status === 'selesai' ? 0 : (order.additional_amount || 0);
-  await c.env.DB.prepare('UPDATE orders SET status = ?, additional_amount = ? WHERE id = ?').bind(status, additionalAmount, id).run();
+  const processedAt = status === 'diproses' ? new Date().toISOString() : (order.processed_at || null);
+  await c.env.DB.prepare('UPDATE orders SET status = ?, additional_amount = ?, processed_at = ? WHERE id = ?').bind(status, additionalAmount, processedAt, id).run();
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   const actor = (c.get('user') as { username?: string })?.username || 'staff';

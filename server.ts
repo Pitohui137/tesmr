@@ -1114,6 +1114,9 @@ app.put('/api/orders/:id/status', authMiddleware, requireRole('owner', 'kasir'),
   }
 
   dbState.orders[orderIndex].status = status;
+  if (status === 'diproses') {
+    dbState.orders[orderIndex].processedAt = new Date().toISOString();
+  }
   if (status === 'selesai') {
     dbState.orders[orderIndex].additionalAmount = 0;
   }

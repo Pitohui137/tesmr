@@ -1,0 +1,261 @@
+diff --git a/server.ts b/server.ts
+index 4dbc3c9..aa65eb9 100644
+--- a/server.ts
++++ b/server.ts
+@@ -1114,6 +1114,9 @@ app.put('/api/orders/:id/status', authMiddleware, requireRole('owner', 'kasir'),
+   }
+ 
+   dbState.orders[orderIndex].status = status;
++  if (status === 'diproses') {
++    dbState.orders[orderIndex].processedAt = new Date().toISOString();
++  }
+   if (status === 'selesai') {
+     dbState.orders[orderIndex].additionalAmount = 0;
+   }
+diff --git a/server/migrate-estimate.sql b/server/migrate-estimate.sql
+new file mode 100644
+index 0000000..85e5b21
+--- /dev/null
++++ b/server/migrate-estimate.sql
+@@ -0,0 +1,7 @@
++-- Migrasi: estimasi waktu penyiapan (mencatat kapan pesanan mulai diproses)
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-estimate.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-estimate.sql
++-- Jalankan SEKALI pada database yang sudah ada, SEBELUM deploy kode baru.
++-- Jika muncul "duplicate column name: processed_at", artinya sudah pernah dijalankan (aman diabaikan).
++
++ALTER TABLE orders ADD COLUMN processed_at TEXT;
+diff --git a/server/schema.sql b/server/schema.sql
+index 958f239..477a503 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS orders (
+   status TEXT NOT NULL,
+   additional_amount INTEGER NOT NULL DEFAULT 0,
+   has_payment_proof INTEGER NOT NULL DEFAULT 0,
++  processed_at TEXT,
+   archived_at TEXT,
+   created_at TEXT NOT NULL
+ );
+diff --git a/server/worker.ts b/server/worker.ts
+index 0233c76..d8ecdb0 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -75,6 +75,7 @@ interface OrderRow {
+   additional_amount?: number;
+   archived_at?: string | null;
+   has_payment_proof?: number;
++  processed_at?: string | null;
+   created_at: string;
+ }
+ 
+@@ -228,6 +229,7 @@ function toOrder(o: OrderRow) {
+     additionalAmount: o.additional_amount || 0,
+     archivedAt: o.archived_at || undefined,
+     hasPaymentProof: !!o.has_payment_proof,
++    processedAt: o.processed_at || undefined,
+   };
+ }
+ 
+@@ -804,7 +806,8 @@ app.put('/api/orders/:id/status', auth, requireRole('owner', 'kasir'), async (c)
+     return c.json({ error: `Transisi status tidak valid: ${order.status} -> ${status}` }, 400);
+   }
+   const additionalAmount = status === 'selesai' ? 0 : (order.additional_amount || 0);
+-  await c.env.DB.prepare('UPDATE orders SET status = ?, additional_amount = ? WHERE id = ?').bind(status, additionalAmount, id).run();
++  const processedAt = status === 'diproses' ? new Date().toISOString() : (order.processed_at || null);
++  await c.env.DB.prepare('UPDATE orders SET status = ?, additional_amount = ?, processed_at = ? WHERE id = ?').bind(status, additionalAmount, processedAt, id).run();
+   invalidateOrdersCache();
+   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
+   const actor = (c.get('user') as { username?: string })?.username || 'staff';
+diff --git a/src/components/CashierDashboard.tsx b/src/components/CashierDashboard.tsx
+index dfcc9cc..7ce738b 100644
+--- a/src/components/CashierDashboard.tsx
++++ b/src/components/CashierDashboard.tsx
+@@ -4,6 +4,7 @@ import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSoun
+ import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
++import { estimateMinutes, formatClock } from '../utils/estimate';
+ 
+ interface CashierDashboardProps {
+   settings: CafeSettings;
+@@ -779,6 +780,25 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                       <span className="text-sm font-extrabold text-brand-deep">{formatPrice(order.totalPrice)}</span>
+                     </div>
+ 
++                    {(order.status === 'menunggu_verifikasi' || order.status === 'diproses') && (() => {
++                      const mins = estimateMinutes(order.items, menuItems);
++                      if (mins <= 0) return null;
++                      const readyAt = order.status === 'diproses' && order.processedAt
++                        ? new Date(order.processedAt).getTime() + mins * 60000
++                        : null;
++                      const late = readyAt !== null && Date.now() > readyAt;
++                      return (
++                        <div className={`flex justify-between items-center text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
++                          <span className="flex items-center gap-1"><Clock size={12} /> Est. {mins} menit</span>
++                          <span>
++                            {readyAt
++                              ? (late ? `Lewat target ${formatClock(readyAt)}` : `Target siap ${formatClock(readyAt)}`)
++                              : 'Mulai dihitung setelah dikonfirmasi'}
++                          </span>
++                        </div>
++                      );
++                    })()}
++
+                     {order.paymentMethod === 'qris' && (
+                       order.hasPaymentProof ? (
+                         <button
+diff --git a/src/components/CustomerView.tsx b/src/components/CustomerView.tsx
+index ddf39af..65e68e4 100644
+--- a/src/components/CustomerView.tsx
++++ b/src/components/CustomerView.tsx
+@@ -1,8 +1,9 @@
+ import React, { useState, useEffect, useRef } from 'react';
+ import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
+-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload } from 'lucide-react';
++import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload, Clock } from 'lucide-react';
+ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+ import { compressImage } from '../utils/image';
++import { estimateMinutes, formatClock } from '../utils/estimate';
+ 
+ const CATEGORY_LABELS: Record<string, string> = {
+   makanan: 'Food Menu',
+@@ -74,6 +75,13 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+   const checkoutInFlightRef = useRef(false);
+   const addItemsInFlightRef = useRef(false);
+ 
++  // Detak tiap 30 detik agar hitung mundur estimasi tampil segar
++  const [nowTick, setNowTick] = useState(() => Date.now());
++  useEffect(() => {
++    const t = setInterval(() => setNowTick(Date.now()), 30000);
++    return () => clearInterval(t);
++  }, []);
++
+   // Upload bukti bayar QRIS
+   const [proofUploading, setProofUploading] = useState(false);
+   const [proofError, setProofError] = useState('');
+@@ -197,6 +205,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+     }, 0);
+   };
+ 
++  const getCartEstimate = () =>
++    estimateMinutes(
++      Object.entries(cart).map(([key, qty]) => ({ menuId: key.split('::')[0], quantity: qty as number })),
++      menu
++    );
++
+   const getCartItemCount = () => {
+     return Object.values(cart).reduce((sum, qty) => (sum as number) + (qty as number), 0) as number;
+   };
+@@ -880,6 +894,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     <span className="text-slate-500 font-semibold text-sm">Total Pembayaran</span>
+                     <span className="text-xl font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                   </div>
++                  {getCartEstimate() > 0 && (
++                    <div className="flex justify-between items-center text-xs text-slate-500 -mt-2 mb-4">
++                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
++                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
++                    </div>
++                  )}
+ 
+                   {error && (
+                     <div className="mb-3 p-3 bg-red-50 border border-red-100 text-red-700 rounded-xl text-xs flex items-center gap-2">
+@@ -959,6 +979,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     <span className="text-slate-500 font-bold text-sm">Total Pembayaran</span>
+                     <span className="text-lg font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                   </div>
++                  {getCartEstimate() > 0 && (
++                    <div className="flex justify-between items-center text-xs text-slate-500">
++                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
++                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
++                    </div>
++                  )}
+                 </div>
+ 
+                 <div className="p-4 bg-slate-50 flex gap-2">
+@@ -1031,6 +1057,36 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+           <div className="p-6 border-b border-slate-100 bg-brand-badge-bg/10">
+             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Status Pesanan Anda</h3>
+ 
++            {(currentOrder.status === 'menunggu_verifikasi' || currentOrder.status === 'diproses') && (() => {
++              const mins = estimateMinutes(currentOrder.items, menu);
++              if (mins <= 0) return null;
++              const readyAt = currentOrder.status === 'diproses' && currentOrder.processedAt
++                ? new Date(currentOrder.processedAt).getTime() + mins * 60000
++                : null;
++              const remaining = readyAt ? Math.max(0, Math.ceil((readyAt - nowTick) / 60000)) : null;
++              return (
++                <div className="mb-5 flex items-start gap-2.5 bg-white border border-brand-badge-border rounded-xl p-3">
++                  <Clock size={16} className="text-brand-forest flex-shrink-0 mt-0.5" />
++                  <div className="min-w-0">
++                    {readyAt ? (
++                      <p className="text-sm font-extrabold text-brand-deep">
++                        {remaining && remaining > 0
++                          ? `Perkiraan siap pukul ${formatClock(readyAt)} (±${remaining} menit lagi)`
++                          : 'Pesanan Anda sebentar lagi siap'}
++                      </p>
++                    ) : (
++                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{mins} menit</p>
++                    )}
++                    <p className="text-[11px] text-slate-500 mt-0.5">
++                      {readyAt
++                        ? `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`
++                        : 'Dihitung sejak pembayaran Anda diverifikasi kasir.'}
++                    </p>
++                  </div>
++                </div>
++              );
++            })()}
++
+             <div className="space-y-6 relative before:absolute before:left-[15px] before:top-4 before:bottom-4 before:w-[2px] before:bg-slate-200">
+               {/* Step 1: Verification */}
+               <div className="flex gap-4 relative">
+diff --git a/src/types.ts b/src/types.ts
+index 1297de3..a262282 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -60,6 +60,7 @@ export interface Order {
+   additionalAmount?: number;
+   archivedAt?: string;
+   hasPaymentProof?: boolean;
++  processedAt?: string;
+ }
+ 
+ export interface CafeSettings {
+diff --git a/src/utils/estimate.ts b/src/utils/estimate.ts
+new file mode 100644
+index 0000000..74c4ce1
+--- /dev/null
++++ b/src/utils/estimate.ts
+@@ -0,0 +1,31 @@
++import { MenuItem } from '../types';
++
++// Estimasi waktu penyiapan per item (menit), menurut kategori menu.
++// Minuman 1 menit; makanan, kudapan, dan dessert masing-masing 3 menit.
++export const MINUTES_PER_ITEM: Record<string, number> = {
++  minuman: 1,
++  makanan: 3,
++  kudapan: 3,
++  dessert: 3,
++};
++const DEFAULT_MINUTES = 3; // menu yang sudah dihapus / kategori tak dikenal
++
++interface EstimateItem {
++  menuId: string;
++  quantity: number;
++  isCancelled?: boolean;
++}
++
++// Total estimasi (menit) = jumlah (menit per item x qty), item dibatalkan tidak dihitung.
++export function estimateMinutes(items: EstimateItem[], menu: MenuItem[]): number {
++  const categoryOf = new Map(menu.map(m => [m.id, m.category as string]));
++  return items.reduce((sum, it) => {
++    if (it.isCancelled) return sum;
++    const perItem = MINUTES_PER_ITEM[categoryOf.get(it.menuId) ?? ''] ?? DEFAULT_MINUTES;
++    return sum + perItem * (Number(it.quantity) || 0);
++  }, 0);
++}
++
++export function formatClock(ms: number): string {
++  return new Date(ms).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
++}
