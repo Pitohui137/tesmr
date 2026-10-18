@@ -59,6 +59,7 @@ export interface Order {
   createdAt: string;
   additionalAmount?: number;
   archivedAt?: string;
+  hasPaymentProof?: boolean;
 }
 
 export interface CafeSettings {

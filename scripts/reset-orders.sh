@@ -47,10 +47,10 @@ echo ""
 echo "=== 3/4 Proses ==="
 if [ "$HARD" -eq 1 ]; then
   echo "  Mode --hard: arsip lalu HAPUS PERMANEN pesanan + nolkan rekap bulanan."
-  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM orders WHERE archived_at IS NOT NULL; DELETE FROM monthly_totals;" >/dev/null
+  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM order_proofs WHERE order_id IN (SELECT id FROM orders WHERE archived_at IS NOT NULL); DELETE FROM orders WHERE archived_at IS NOT NULL; DELETE FROM monthly_totals;" >/dev/null
 else
   echo "  Mode soft: arsip pesanan (riwayat hilang dari daftar kasir, rekap bulanan tetap dihitung)."
-  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL;" >/dev/null
+  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM order_proofs WHERE order_id IN (SELECT id FROM orders WHERE archived_at IS NOT NULL);" >/dev/null
 fi
 
 AFTER=$(npx wrangler d1 execute "$DB_NAME" --remote --json --command "SELECT COUNT(*) AS c FROM orders WHERE archived_at IS NULL;" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['results'][0]['c'])")

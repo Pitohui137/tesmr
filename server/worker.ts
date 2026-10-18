@@ -11,6 +11,7 @@ interface D1PreparedStatement {
 }
 interface D1Database {
   prepare(query: string): D1PreparedStatement;
+  batch(statements: D1PreparedStatement[]): Promise<unknown[]>;
 }
 interface Fetcher {
   fetch(input: Request | string, init?: RequestInit): Promise<Response>;
@@ -73,6 +74,7 @@ interface OrderRow {
   status: string;
   additional_amount?: number;
   archived_at?: string | null;
+  has_payment_proof?: number;
   created_at: string;
 }
 
@@ -225,6 +227,7 @@ function toOrder(o: OrderRow) {
     createdAt: o.created_at,
     additionalAmount: o.additional_amount || 0,
     archivedAt: o.archived_at || undefined,
+    hasPaymentProof: !!o.has_payment_proof,
   };
 }
 
@@ -756,6 +759,40 @@ app.get('/api/orders/:id', async (c) => {
   return c.json(toOrder(row));
 });
 
+// Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
+const PROOF_MAX_CHARS = 500_000;
+const PROOF_REGEX = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+app.post('/api/orders/:id/proof', async (c) => {
+  const { id } = c.req.param();
+  const { image } = await c.req.json().catch(() => ({}));
+  if (typeof image !== 'string') return c.json({ error: 'Gambar bukti bayar wajib diisi' }, 400);
+  if (image.length > PROOF_MAX_CHARS) return c.json({ error: 'Ukuran gambar terlalu besar, gunakan screenshot yang lebih kecil' }, 413);
+  if (!PROOF_REGEX.test(image)) return c.json({ error: 'Format gambar tidak valid (gunakan JPG/PNG/WebP)' }, 400);
+  const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
+  if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
+  if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
+  if (order.payment_method !== 'qris') return c.json({ error: 'Bukti bayar hanya untuk pembayaran QRIS' }, 400);
+  if (order.status !== 'menunggu_verifikasi') return c.json({ error: 'Pesanan sudah diverifikasi, bukti bayar tidak dapat diubah' }, 400);
+  await c.env.DB.batch([
+    c.env.DB.prepare('INSERT INTO order_proofs (order_id, image, created_at) VALUES (?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET image = excluded.image, created_at = excluded.created_at')
+      .bind(id, image, new Date().toISOString()),
+    c.env.DB.prepare('UPDATE orders SET has_payment_proof = 1 WHERE id = ?').bind(id),
+  ]);
+  invalidateOrdersCache();
+  await logApp(c, 'INFO', `Bukti bayar diunggah: ${id} (meja ${order.table_number})`, { orderId: id, table: order.table_number });
+  return c.json({ message: 'Bukti bayar berhasil dikirim' });
+});
+
+// Kasir/owner melihat bukti bayar
+app.get('/api/orders/:id/proof', auth, requireRole('owner', 'kasir', 'admin'), async (c) => {
+  const { id } = c.req.param();
+  const row = await c.env.DB.prepare('SELECT image, created_at FROM order_proofs WHERE order_id = ?').bind(id).first<{ image: string; created_at: string }>();
+  if (!row) return c.json({ error: 'Bukti bayar belum diunggah' }, 404);
+  c.header('Cache-Control', 'no-store');
+  return c.json({ image: row.image, createdAt: row.created_at });
+});
+
 app.put('/api/orders/:id/status', auth, requireRole('owner', 'kasir'), async (c) => {
   const { id } = c.req.param();
   const { status } = await c.req.json().catch(() => ({}));
@@ -793,7 +830,10 @@ app.delete('/api/orders/:id', auth, requireRole('owner', 'kasir'), async (c) => 
   const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
   if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
-  await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM order_proofs WHERE order_id = ?').bind(id),
+    c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id),
+  ]);
   invalidateOrdersCache();
   return c.json({ message: 'Pesanan berhasil dihapus', order: toOrder(order) });
 });

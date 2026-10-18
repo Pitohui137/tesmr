@@ -44,7 +44,16 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_method TEXT NOT NULL,
   status TEXT NOT NULL,
   additional_amount INTEGER NOT NULL DEFAULT 0,
+  has_payment_proof INTEGER NOT NULL DEFAULT 0,
   archived_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+-- Bukti bayar QRIS (screenshot, data URL). Dipisah dari tabel orders agar
+-- daftar pesanan yang di-poll kasir tetap ringan.
+CREATE TABLE IF NOT EXISTS order_proofs (
+  order_id TEXT PRIMARY KEY,
+  image TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 

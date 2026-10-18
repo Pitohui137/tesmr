@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Order, OrderStatus, CafeSettings, MenuItem, UserAccount } from '../types';
 import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSound, clearCustomSound } from '../utils/audio';
-import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle } from 'lucide-react';
+import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
 
@@ -17,6 +17,11 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedReceiptOrder, setSelectedReceiptOrder] = useState<Order | null>(null);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState<string | null>(null);
+  const [proofOrder, setProofOrder] = useState<Order | null>(null);
+  const [proofImage, setProofImage] = useState('');
+  const [proofTime, setProofTime] = useState('');
+  const [proofLoading, setProofLoading] = useState(false);
+  const [proofError, setProofError] = useState('');
   const [audioEnabled, setAudioEnabled] = useState<boolean>(true);
   const [addItemModalOrder, setAddItemModalOrder] = useState<Order | null>(null);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
@@ -136,6 +141,28 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
       }
     } catch (err) {
       console.error("Failed to set variant stock:", err);
+    }
+  };
+
+  const openProof = async (order: Order) => {
+    setProofOrder(order);
+    setProofImage('');
+    setProofTime('');
+    setProofError('');
+    setProofLoading(true);
+    try {
+      const res = await apiFetch(`/api/orders/${order.id}/proof`, undefined, onLogout);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.image) {
+        setProofImage(data.image);
+        setProofTime(data.createdAt || '');
+      } else {
+        setProofError(data.error || 'Gagal memuat bukti bayar');
+      }
+    } catch {
+      setProofError('Gagal memuat bukti bayar');
+    } finally {
+      setProofLoading(false);
     }
   };
 
@@ -330,7 +357,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
       case 'diproses':
         return <span className="bg-brand-badge-bg text-brand-forest border border-brand-badge-border text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full">Diproses</span>;
       case 'siap_diambil':
-        return <span className="bg-blue-50 text-blue-700 border border-blue-150 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full">Siap Diambil</span>;
+        return <span className="bg-blue-50 text-blue-700 border border-blue-150 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full">Pesanan Siap</span>;
       case 'selesai':
         return <span className="bg-slate-100 text-slate-700 border border-slate-200 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full">Selesai</span>;
       case 'dibatalkan':
@@ -529,7 +556,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                 { id: 'semua', label: 'Semua Pesanan' },
                 { id: 'menunggu_verifikasi', label: 'Menunggu Verifikasi' },
                 { id: 'diproses', label: 'Diproses' },
-                { id: 'siap_diambil', label: 'Siap Diambil' },
+                { id: 'siap_diambil', label: 'Pesanan Siap' },
                 { id: 'selesai', label: 'Selesai' },
                 { id: 'stok', label: 'Stok Menu' }
               ].map(tab => (
@@ -752,6 +779,21 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span className="text-sm font-extrabold text-brand-deep">{formatPrice(order.totalPrice)}</span>
                     </div>
 
+                    {order.paymentMethod === 'qris' && (
+                      order.hasPaymentProof ? (
+                        <button
+                          onClick={() => openProof(order)}
+                          className="w-full flex items-center justify-center gap-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 font-bold text-[11px] py-2 rounded-lg transition-all cursor-pointer"
+                        >
+                          <ImageIcon size={13} /> Lihat Bukti Bayar
+                        </button>
+                      ) : order.status === 'menunggu_verifikasi' ? (
+                        <div className="text-[10px] font-bold text-slate-400 bg-slate-50 border border-dashed border-slate-200 rounded-lg px-2 py-1.5 text-center">
+                          Belum ada bukti bayar
+                        </div>
+                      ) : null
+                    )}
+
                     {(order.additionalAmount || 0) > 0 && (
                       <div className="flex items-start gap-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-2 py-1.5">
                         <AlertCircle size={12} className="flex-shrink-0 mt-0.5" />
@@ -804,7 +846,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                           title="Pesanan selesai dibuat. Nyalakan pager Kolmi CS101 saat menekan tombol."
                         >
                           <Play size={14} className="fill-current" />
-                          Set Siap Diambil
+                          Set Pesanan Siap
                         </button>
                       )}
 
@@ -855,6 +897,79 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
           <p className="text-center text-[10px] text-slate-400 pt-2">© {new Date().getFullYear()} {settings.name} — Semua hak cipta dilindungi.</p>
         </main>
       </div>
+
+      {/* BUKTI BAYAR QRIS POPUP */}
+      <AnimatePresence>
+        {proofOrder && (() => {
+          const live = orders.find(o => o.id === proofOrder.id) || proofOrder;
+          return (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setProofOrder(null)}>
+              <motion.div
+                initial={{ scale: 0.95, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.95, opacity: 0 }}
+                onClick={(e) => e.stopPropagation()}
+                className="bg-white rounded-2xl w-full max-w-sm overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]"
+              >
+                <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
+                  <span className="font-bold text-slate-800 text-xs uppercase tracking-wider flex items-center gap-1.5">
+                    <ImageIcon size={14} /> Bukti Bayar QRIS
+                  </span>
+                  <button
+                    onClick={() => setProofOrder(null)}
+                    className="p-1 bg-white hover:bg-slate-200 rounded-full border border-slate-200 cursor-pointer"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+
+                <div className="p-4 overflow-y-auto space-y-3">
+                  <div className="bg-brand-badge-bg/50 border border-brand-badge-border rounded-xl p-3 space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-500 font-bold">Pemesan</span>
+                      <span className="font-extrabold text-slate-800">{live.customerName} • MEJA {live.tableNumber}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-500 font-bold text-xs">Total Tagihan</span>
+                      <span className="text-lg font-black text-brand-deep">{formatPrice(live.totalPrice)}</span>
+                    </div>
+                    {proofTime && (
+                      <div className="flex justify-between text-[10px] text-slate-400">
+                        <span>Diunggah</span>
+                        <span>{new Date(proofTime).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {proofLoading ? (
+                    <div className="py-12 text-center text-xs text-slate-400 font-semibold">Memuat bukti bayar...</div>
+                  ) : proofError ? (
+                    <div className="py-8 text-center text-xs text-red-500 font-semibold">{proofError}</div>
+                  ) : (
+                    <img src={proofImage} alt="Bukti bayar" className="w-full max-h-[50vh] object-contain rounded-xl border border-slate-100 bg-slate-50" />
+                  )}
+
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    Cocokkan nominal dan jam pada screenshot dengan mutasi/notifikasi di aplikasi merchant sebelum konfirmasi.
+                  </p>
+                </div>
+
+                {live.status === 'menunggu_verifikasi' && (
+                  <div className="p-3 bg-slate-50 border-t border-slate-100">
+                    <button
+                      onClick={async () => { await handleUpdateStatus(live.id, 'diproses'); setProofOrder(null); }}
+                      disabled={isUpdatingStatus === live.id}
+                      className="w-full bg-yellow-500 hover:bg-yellow-600 disabled:bg-slate-200 text-yellow-950 font-bold py-2.5 rounded-lg text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      <ClipboardCheck size={14} /> Konfirmasi Pembayaran
+                    </button>
+                  </div>
+                )}
+              </motion.div>
+            </div>
+          );
+        })()}
+      </AnimatePresence>
 
       {/* RECEIPT / STRUK POPUP (Aesthetic 58mm Thermal Printer Layout) */}
       <AnimatePresence>

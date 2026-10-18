@@ -1,0 +1,462 @@
+diff --git a/scripts/reset-orders.sh b/scripts/reset-orders.sh
+index 1e9f1a9..479ca0a 100644
+--- a/scripts/reset-orders.sh
++++ b/scripts/reset-orders.sh
+@@ -47,10 +47,10 @@ echo ""
+ echo "=== 3/4 Proses ==="
+ if [ "$HARD" -eq 1 ]; then
+   echo "  Mode --hard: arsip lalu HAPUS PERMANEN pesanan + nolkan rekap bulanan."
+-  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM orders WHERE archived_at IS NOT NULL; DELETE FROM monthly_totals;" >/dev/null
++  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM order_proofs WHERE order_id IN (SELECT id FROM orders WHERE archived_at IS NOT NULL); DELETE FROM orders WHERE archived_at IS NOT NULL; DELETE FROM monthly_totals;" >/dev/null
+ else
+   echo "  Mode soft: arsip pesanan (riwayat hilang dari daftar kasir, rekap bulanan tetap dihitung)."
+-  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL;" >/dev/null
++  npx wrangler d1 execute "$DB_NAME" --remote --command "UPDATE orders SET archived_at = datetime('now') WHERE archived_at IS NULL; DELETE FROM order_proofs WHERE order_id IN (SELECT id FROM orders WHERE archived_at IS NOT NULL);" >/dev/null
+ fi
+ 
+ AFTER=$(npx wrangler d1 execute "$DB_NAME" --remote --json --command "SELECT COUNT(*) AS c FROM orders WHERE archived_at IS NULL;" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['results'][0]['c'])")
+diff --git a/server.ts b/server.ts
+index 8659f93..4dbc3c9 100644
+--- a/server.ts
++++ b/server.ts
+@@ -457,6 +457,7 @@ interface DBState {
+   menu: MenuItem[];
+   orders: Order[];
+   appLogs?: AppLog[];
++  proofs?: Record<string, { image: string; createdAt: string }>;
+ }
+ 
+ let dbState: DBState = {
+@@ -1055,6 +1056,38 @@ app.get('/api/orders/:id', (req, res) => {
+   res.json(order);
+ });
+ 
++// Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
++const PROOF_MAX_CHARS = 500_000;
++const PROOF_REGEX = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
++
++app.post('/api/orders/:id/proof', (req, res) => {
++  const { id } = req.params;
++  const image = req.body?.image;
++  if (typeof image !== 'string') return res.status(400).json({ error: 'Gambar bukti bayar wajib diisi' });
++  if (image.length > PROOF_MAX_CHARS) return res.status(413).json({ error: 'Ukuran gambar terlalu besar, gunakan screenshot yang lebih kecil' });
++  if (!PROOF_REGEX.test(image)) return res.status(400).json({ error: 'Format gambar tidak valid (gunakan JPG/PNG/WebP)' });
++  const order = dbState.orders.find(o => o.id === id);
++  if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
++  if (order.archivedAt) return res.status(400).json({ error: 'Pesanan sudah diarsipkan' });
++  if (order.paymentMethod !== 'qris') return res.status(400).json({ error: 'Bukti bayar hanya untuk pembayaran QRIS' });
++  if (order.status !== 'menunggu_verifikasi') return res.status(400).json({ error: 'Pesanan sudah diverifikasi, bukti bayar tidak dapat diubah' });
++  dbState.proofs = dbState.proofs || {};
++  dbState.proofs[id] = { image, createdAt: new Date().toISOString() };
++  order.hasPaymentProof = true;
++  saveDB();
++  notifyClientsRefresh();
++  logApp('INFO', `Bukti bayar diunggah: ${id} (meja ${order.tableNumber})`, { orderId: id, table: order.tableNumber });
++  res.json({ message: 'Bukti bayar berhasil dikirim' });
++});
++
++// Kasir/owner melihat bukti bayar
++app.get('/api/orders/:id/proof', authMiddleware, requireRole('owner', 'kasir', 'admin'), (req, res) => {
++  const proof = dbState.proofs?.[req.params.id];
++  if (!proof) return res.status(404).json({ error: 'Bukti bayar belum diunggah' });
++  res.setHeader('Cache-Control', 'no-store');
++  res.json(proof);
++});
++
+ app.put('/api/orders/:id/status', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+   const { id } = req.params;
+   const { status } = req.body;
+@@ -1200,6 +1233,7 @@ app.delete('/api/orders/:id', authMiddleware, requireRole('owner', 'kasir'), (re
+   }
+ 
+   const deleted = dbState.orders.splice(orderIndex, 1);
++  if (dbState.proofs) delete dbState.proofs[id];
+   saveDB();
+   res.json({ message: "Pesanan berhasil dihapus", order: deleted[0] });
+ });
+diff --git a/server/migrate-payment-proof.sql b/server/migrate-payment-proof.sql
+new file mode 100644
+index 0000000..c8ee74b
+--- /dev/null
++++ b/server/migrate-payment-proof.sql
+@@ -0,0 +1,13 @@
++-- Migrasi: fitur upload bukti bayar QRIS
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-payment-proof.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-payment-proof.sql
++-- Jalankan SEKALI pada database yang sudah ada (database baru sudah memakai schema.sql terbaru).
++-- Jika muncul "duplicate column name: has_payment_proof", artinya sudah pernah dijalankan (aman diabaikan).
++
++ALTER TABLE orders ADD COLUMN has_payment_proof INTEGER NOT NULL DEFAULT 0;
++
++CREATE TABLE IF NOT EXISTS order_proofs (
++  order_id TEXT PRIMARY KEY,
++  image TEXT NOT NULL,
++  created_at TEXT NOT NULL
++);
+diff --git a/server/schema.sql b/server/schema.sql
+index 703250b..958f239 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -44,10 +44,19 @@ CREATE TABLE IF NOT EXISTS orders (
+   payment_method TEXT NOT NULL,
+   status TEXT NOT NULL,
+   additional_amount INTEGER NOT NULL DEFAULT 0,
++  has_payment_proof INTEGER NOT NULL DEFAULT 0,
+   archived_at TEXT,
+   created_at TEXT NOT NULL
+ );
+ 
++-- Bukti bayar QRIS (screenshot, data URL). Dipisah dari tabel orders agar
++-- daftar pesanan yang di-poll kasir tetap ringan.
++CREATE TABLE IF NOT EXISTS order_proofs (
++  order_id TEXT PRIMARY KEY,
++  image TEXT NOT NULL,
++  created_at TEXT NOT NULL
++);
++
+ CREATE TABLE IF NOT EXISTS daily_stats (
+   date TEXT PRIMARY KEY,
+   requests INTEGER NOT NULL DEFAULT 0,
+diff --git a/server/worker.ts b/server/worker.ts
+index b1f2c55..0233c76 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -11,6 +11,7 @@ interface D1PreparedStatement {
+ }
+ interface D1Database {
+   prepare(query: string): D1PreparedStatement;
++  batch(statements: D1PreparedStatement[]): Promise<unknown[]>;
+ }
+ interface Fetcher {
+   fetch(input: Request | string, init?: RequestInit): Promise<Response>;
+@@ -73,6 +74,7 @@ interface OrderRow {
+   status: string;
+   additional_amount?: number;
+   archived_at?: string | null;
++  has_payment_proof?: number;
+   created_at: string;
+ }
+ 
+@@ -225,6 +227,7 @@ function toOrder(o: OrderRow) {
+     createdAt: o.created_at,
+     additionalAmount: o.additional_amount || 0,
+     archivedAt: o.archived_at || undefined,
++    hasPaymentProof: !!o.has_payment_proof,
+   };
+ }
+ 
+@@ -756,6 +759,40 @@ app.get('/api/orders/:id', async (c) => {
+   return c.json(toOrder(row));
+ });
+ 
++// Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
++const PROOF_MAX_CHARS = 500_000;
++const PROOF_REGEX = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
++
++app.post('/api/orders/:id/proof', async (c) => {
++  const { id } = c.req.param();
++  const { image } = await c.req.json().catch(() => ({}));
++  if (typeof image !== 'string') return c.json({ error: 'Gambar bukti bayar wajib diisi' }, 400);
++  if (image.length > PROOF_MAX_CHARS) return c.json({ error: 'Ukuran gambar terlalu besar, gunakan screenshot yang lebih kecil' }, 413);
++  if (!PROOF_REGEX.test(image)) return c.json({ error: 'Format gambar tidak valid (gunakan JPG/PNG/WebP)' }, 400);
++  const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
++  if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
++  if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
++  if (order.payment_method !== 'qris') return c.json({ error: 'Bukti bayar hanya untuk pembayaran QRIS' }, 400);
++  if (order.status !== 'menunggu_verifikasi') return c.json({ error: 'Pesanan sudah diverifikasi, bukti bayar tidak dapat diubah' }, 400);
++  await c.env.DB.batch([
++    c.env.DB.prepare('INSERT INTO order_proofs (order_id, image, created_at) VALUES (?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET image = excluded.image, created_at = excluded.created_at')
++      .bind(id, image, new Date().toISOString()),
++    c.env.DB.prepare('UPDATE orders SET has_payment_proof = 1 WHERE id = ?').bind(id),
++  ]);
++  invalidateOrdersCache();
++  await logApp(c, 'INFO', `Bukti bayar diunggah: ${id} (meja ${order.table_number})`, { orderId: id, table: order.table_number });
++  return c.json({ message: 'Bukti bayar berhasil dikirim' });
++});
++
++// Kasir/owner melihat bukti bayar
++app.get('/api/orders/:id/proof', auth, requireRole('owner', 'kasir', 'admin'), async (c) => {
++  const { id } = c.req.param();
++  const row = await c.env.DB.prepare('SELECT image, created_at FROM order_proofs WHERE order_id = ?').bind(id).first<{ image: string; created_at: string }>();
++  if (!row) return c.json({ error: 'Bukti bayar belum diunggah' }, 404);
++  c.header('Cache-Control', 'no-store');
++  return c.json({ image: row.image, createdAt: row.created_at });
++});
++
+ app.put('/api/orders/:id/status', auth, requireRole('owner', 'kasir'), async (c) => {
+   const { id } = c.req.param();
+   const { status } = await c.req.json().catch(() => ({}));
+@@ -793,7 +830,10 @@ app.delete('/api/orders/:id', auth, requireRole('owner', 'kasir'), async (c) =>
+   const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
+   if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
+   if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
+-  await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
++  await c.env.DB.batch([
++    c.env.DB.prepare('DELETE FROM order_proofs WHERE order_id = ?').bind(id),
++    c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id),
++  ]);
+   invalidateOrdersCache();
+   return c.json({ message: 'Pesanan berhasil dihapus', order: toOrder(order) });
+ });
+diff --git a/src/components/CashierDashboard.tsx b/src/components/CashierDashboard.tsx
+index 2a351f5..e03c56a 100644
+--- a/src/components/CashierDashboard.tsx
++++ b/src/components/CashierDashboard.tsx
+@@ -1,7 +1,7 @@
+ import React, { useState, useEffect, useRef } from 'react';
+ import { Order, OrderStatus, CafeSettings, MenuItem, UserAccount } from '../types';
+ import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSound, clearCustomSound } from '../utils/audio';
+-import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle } from 'lucide-react';
++import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
+ 
+@@ -17,6 +17,11 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+   const [searchQuery, setSearchQuery] = useState<string>('');
+   const [selectedReceiptOrder, setSelectedReceiptOrder] = useState<Order | null>(null);
+   const [isUpdatingStatus, setIsUpdatingStatus] = useState<string | null>(null);
++  const [proofOrder, setProofOrder] = useState<Order | null>(null);
++  const [proofImage, setProofImage] = useState('');
++  const [proofTime, setProofTime] = useState('');
++  const [proofLoading, setProofLoading] = useState(false);
++  const [proofError, setProofError] = useState('');
+   const [audioEnabled, setAudioEnabled] = useState<boolean>(true);
+   const [addItemModalOrder, setAddItemModalOrder] = useState<Order | null>(null);
+   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
+@@ -139,6 +144,28 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+     }
+   };
+ 
++  const openProof = async (order: Order) => {
++    setProofOrder(order);
++    setProofImage('');
++    setProofTime('');
++    setProofError('');
++    setProofLoading(true);
++    try {
++      const res = await apiFetch(`/api/orders/${order.id}/proof`, undefined, onLogout);
++      const data = await res.json().catch(() => ({}));
++      if (res.ok && data.image) {
++        setProofImage(data.image);
++        setProofTime(data.createdAt || '');
++      } else {
++        setProofError(data.error || 'Gagal memuat bukti bayar');
++      }
++    } catch {
++      setProofError('Gagal memuat bukti bayar');
++    } finally {
++      setProofLoading(false);
++    }
++  };
++
+   const handleUpdateStatus = async (orderId: string, nextStatus: OrderStatus) => {
+     setIsUpdatingStatus(orderId);
+     setError('');
+@@ -752,6 +779,21 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                       <span className="text-sm font-extrabold text-brand-deep">{formatPrice(order.totalPrice)}</span>
+                     </div>
+ 
++                    {order.paymentMethod === 'qris' && (
++                      order.hasPaymentProof ? (
++                        <button
++                          onClick={() => openProof(order)}
++                          className="w-full flex items-center justify-center gap-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 font-bold text-[11px] py-2 rounded-lg transition-all cursor-pointer"
++                        >
++                          <ImageIcon size={13} /> Lihat Bukti Bayar
++                        </button>
++                      ) : order.status === 'menunggu_verifikasi' ? (
++                        <div className="text-[10px] font-bold text-slate-400 bg-slate-50 border border-dashed border-slate-200 rounded-lg px-2 py-1.5 text-center">
++                          Belum ada bukti bayar
++                        </div>
++                      ) : null
++                    )}
++
+                     {(order.additionalAmount || 0) > 0 && (
+                       <div className="flex items-start gap-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-2 py-1.5">
+                         <AlertCircle size={12} className="flex-shrink-0 mt-0.5" />
+@@ -856,6 +898,79 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+         </main>
+       </div>
+ 
++      {/* BUKTI BAYAR QRIS POPUP */}
++      <AnimatePresence>
++        {proofOrder && (() => {
++          const live = orders.find(o => o.id === proofOrder.id) || proofOrder;
++          return (
++            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setProofOrder(null)}>
++              <motion.div
++                initial={{ scale: 0.95, opacity: 0 }}
++                animate={{ scale: 1, opacity: 1 }}
++                exit={{ scale: 0.95, opacity: 0 }}
++                onClick={(e) => e.stopPropagation()}
++                className="bg-white rounded-2xl w-full max-w-sm overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]"
++              >
++                <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
++                  <span className="font-bold text-slate-800 text-xs uppercase tracking-wider flex items-center gap-1.5">
++                    <ImageIcon size={14} /> Bukti Bayar QRIS
++                  </span>
++                  <button
++                    onClick={() => setProofOrder(null)}
++                    className="p-1 bg-white hover:bg-slate-200 rounded-full border border-slate-200 cursor-pointer"
++                  >
++                    <X size={14} />
++                  </button>
++                </div>
++
++                <div className="p-4 overflow-y-auto space-y-3">
++                  <div className="bg-brand-badge-bg/50 border border-brand-badge-border rounded-xl p-3 space-y-1">
++                    <div className="flex justify-between text-xs">
++                      <span className="text-slate-500 font-bold">Pemesan</span>
++                      <span className="font-extrabold text-slate-800">{live.customerName} • MEJA {live.tableNumber}</span>
++                    </div>
++                    <div className="flex justify-between items-center">
++                      <span className="text-slate-500 font-bold text-xs">Total Tagihan</span>
++                      <span className="text-lg font-black text-brand-deep">{formatPrice(live.totalPrice)}</span>
++                    </div>
++                    {proofTime && (
++                      <div className="flex justify-between text-[10px] text-slate-400">
++                        <span>Diunggah</span>
++                        <span>{new Date(proofTime).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
++                      </div>
++                    )}
++                  </div>
++
++                  {proofLoading ? (
++                    <div className="py-12 text-center text-xs text-slate-400 font-semibold">Memuat bukti bayar...</div>
++                  ) : proofError ? (
++                    <div className="py-8 text-center text-xs text-red-500 font-semibold">{proofError}</div>
++                  ) : (
++                    <img src={proofImage} alt="Bukti bayar" className="w-full max-h-[50vh] object-contain rounded-xl border border-slate-100 bg-slate-50" />
++                  )}
++
++                  <p className="text-[10px] text-slate-400 leading-snug">
++                    Cocokkan nominal dan jam pada screenshot dengan mutasi/notifikasi di aplikasi merchant sebelum konfirmasi.
++                  </p>
++                </div>
++
++                {live.status === 'menunggu_verifikasi' && (
++                  <div className="p-3 bg-slate-50 border-t border-slate-100">
++                    <button
++                      onClick={async () => { await handleUpdateStatus(live.id, 'diproses'); setProofOrder(null); }}
++                      disabled={isUpdatingStatus === live.id}
++                      className="w-full bg-yellow-500 hover:bg-yellow-600 disabled:bg-slate-200 text-yellow-950 font-bold py-2.5 rounded-lg text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
++                    >
++                      <ClipboardCheck size={14} /> Konfirmasi Pembayaran
++                    </button>
++                  </div>
++                )}
++              </motion.div>
++            </div>
++          );
++        })()}
++      </AnimatePresence>
++
+       {/* RECEIPT / STRUK POPUP (Aesthetic 58mm Thermal Printer Layout) */}
+       <AnimatePresence>
+         {selectedReceiptOrder && (
+diff --git a/src/components/CustomerView.tsx b/src/components/CustomerView.tsx
+index 05fc1ad..c1932cc 100644
+--- a/src/components/CustomerView.tsx
++++ b/src/components/CustomerView.tsx
+@@ -1,7 +1,8 @@
+ import React, { useState, useEffect, useRef } from 'react';
+ import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
+-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame } from 'lucide-react';
++import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload } from 'lucide-react';
+ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
++import { compressImage } from '../utils/image';
+ 
+ const CATEGORY_LABELS: Record<string, string> = {
+   makanan: 'Food Menu',
+@@ -73,6 +74,40 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+   const checkoutInFlightRef = useRef(false);
+   const addItemsInFlightRef = useRef(false);
+ 
++  // Upload bukti bayar QRIS
++  const [proofUploading, setProofUploading] = useState(false);
++  const [proofError, setProofError] = useState('');
++  const [proofPreview, setProofPreview] = useState<{ orderId: string; url: string } | null>(null);
++
++  const handleUploadProof = async (file?: File) => {
++    const orderId = placedOrder?.id;
++    if (!file || !orderId) return;
++    if (!file.type.startsWith('image/')) {
++      setProofError('File harus berupa gambar (JPG/PNG).');
++      return;
++    }
++    setProofUploading(true);
++    setProofError('');
++    try {
++      let dataUrl = await compressImage(file, 900, 0.7);
++      if (dataUrl.length > 450_000) dataUrl = await compressImage(file, 700, 0.55);
++      const res = await fetch(`/api/orders/${orderId}/proof`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ image: dataUrl })
++      });
++      const data = await res.json().catch(() => ({}));
++      if (!res.ok) throw new Error(data.error || 'Gagal mengunggah bukti bayar');
++      setProofPreview({ orderId, url: dataUrl });
++      setOrderStatusPoll(prev => (prev ? { ...prev, hasPaymentProof: true } : prev));
++      setPlacedOrder(prev => (prev ? { ...prev, hasPaymentProof: true } : prev));
++    } catch (err) {
++      setProofError((err as Error).message || 'Gagal mengunggah bukti bayar');
++    } finally {
++      setProofUploading(false);
++    }
++  };
++
+   // Extract table number from URL on mount, restore from localStorage
+   useEffect(() => {
+     const params = new URLSearchParams(window.location.search);
+@@ -1147,8 +1182,37 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     <span className="font-extrabold text-brand-deep">{formatPrice(currentOrder.totalPrice)}</span>
+                   </div>
+                   <p className="text-[11px] text-slate-500 leading-normal bg-white p-2.5 rounded-lg border border-slate-100">
+-                    Silakan scan QR Code di atas menggunakan aplikasi Bank, GoPay, OVO, Dana, atau LinkAja Anda. Infokan nama pemesan ke Kasir untuk validasi cepat.
++                    Silakan scan QR Code di atas menggunakan aplikasi Bank, GoPay, OVO, Dana, atau LinkAja Anda. Setelah membayar, upload screenshot bukti pembayaran di bawah agar kasir bisa memverifikasi lebih cepat.
+                   </p>
++
++                  <div className="bg-white p-3 rounded-lg border border-dashed border-brand-badge-border space-y-2 text-left">
++                    <p className="text-[11px] font-bold text-slate-700">Sudah bayar? Upload bukti pembayaran</p>
++                    {currentOrder.hasPaymentProof && (
++                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-2 font-semibold">
++                        <Check size={14} className="flex-shrink-0" /> Bukti terkirim. Kasir akan memverifikasi pembayaran Anda.
++                      </div>
++                    )}
++                    {proofPreview?.orderId === currentOrder.id && (
++                      <img src={proofPreview.url} alt="Bukti bayar" className="w-full max-h-48 object-contain rounded-lg border border-slate-100 bg-slate-50" />
++                    )}
++                    <label className="block">
++                      <input
++                        type="file"
++                        accept="image/*"
++                        className="hidden"
++                        disabled={proofUploading}
++                        onChange={(e) => {
++                          handleUploadProof(e.target.files?.[0]);
++                          e.target.value = '';
++                        }}
++                      />
++                      <span className={`w-full inline-flex items-center justify-center gap-1.5 text-[11px] font-bold py-2 rounded-lg transition-all ${proofUploading ? 'bg-slate-200 text-slate-500 cursor-wait' : 'bg-brand-forest hover:bg-brand-deep text-white cursor-pointer'}`}>
++                        <Upload size={13} />
++                        {proofUploading ? 'Mengunggah...' : currentOrder.hasPaymentProof ? 'Ganti Bukti Bayar' : 'Pilih Screenshot Bukti Bayar'}
++                      </span>
++                    </label>
++                    {proofError && <p className="text-[11px] text-red-500 font-semibold">{proofError}</p>}
++                  </div>
+                 </div>
+               </>
+             ) : (
+diff --git a/src/types.ts b/src/types.ts
+index 4943ef4..1297de3 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -59,6 +59,7 @@ export interface Order {
+   createdAt: string;
+   additionalAmount?: number;
+   archivedAt?: string;
++  hasPaymentProof?: boolean;
+ }
+ 
+ export interface CafeSettings {

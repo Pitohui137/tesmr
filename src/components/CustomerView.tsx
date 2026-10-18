@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame } from 'lucide-react';
+import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+import { compressImage } from '../utils/image';
 
 const CATEGORY_LABELS: Record<string, string> = {
   makanan: 'Food Menu',
@@ -72,6 +73,40 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   const [addItemsMessage, setAddItemsMessage] = useState<string>('');
   const checkoutInFlightRef = useRef(false);
   const addItemsInFlightRef = useRef(false);
+
+  // Upload bukti bayar QRIS
+  const [proofUploading, setProofUploading] = useState(false);
+  const [proofError, setProofError] = useState('');
+  const [proofPreview, setProofPreview] = useState<{ orderId: string; url: string } | null>(null);
+
+  const handleUploadProof = async (file?: File) => {
+    const orderId = placedOrder?.id;
+    if (!file || !orderId) return;
+    if (!file.type.startsWith('image/')) {
+      setProofError('File harus berupa gambar (JPG/PNG).');
+      return;
+    }
+    setProofUploading(true);
+    setProofError('');
+    try {
+      let dataUrl = await compressImage(file, 900, 0.7);
+      if (dataUrl.length > 450_000) dataUrl = await compressImage(file, 700, 0.55);
+      const res = await fetch(`/api/orders/${orderId}/proof`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: dataUrl })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Gagal mengunggah bukti bayar');
+      setProofPreview({ orderId, url: dataUrl });
+      setOrderStatusPoll(prev => (prev ? { ...prev, hasPaymentProof: true } : prev));
+      setPlacedOrder(prev => (prev ? { ...prev, hasPaymentProof: true } : prev));
+    } catch (err) {
+      setProofError((err as Error).message || 'Gagal mengunggah bukti bayar');
+    } finally {
+      setProofUploading(false);
+    }
+  };
 
   // Extract table number from URL on mount, restore from localStorage
   useEffect(() => {
@@ -1049,9 +1084,9 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                   <h4 className={`font-bold text-sm ${currentOrder.status === 'siap_diambil' ? 'text-blue-800' :
                     currentOrder.status === 'selesai' ? 'text-slate-800' : 'text-slate-400'
                     }`}>
-                    Siap Diambil
+                    Pesanan Siap
                   </h4>
-                  <p className="text-xs text-slate-500 mt-0.5">Pesanan selesai dibuat. Silakan ambil di meja kasir, pager Anda akan bergetar.</p>
+                  <p className="text-xs text-slate-500 mt-0.5">Pesanan selesai dibuat.</p>
                 </div>
               </div>
 
@@ -1147,8 +1182,37 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     <span className="font-extrabold text-brand-deep">{formatPrice(currentOrder.totalPrice)}</span>
                   </div>
                   <p className="text-[11px] text-slate-500 leading-normal bg-white p-2.5 rounded-lg border border-slate-100">
-                    Silakan scan QR Code di atas menggunakan aplikasi Bank, GoPay, OVO, Dana, atau LinkAja Anda. Infokan nama pemesan ke Kasir untuk validasi cepat.
+                    Silakan scan QR Code di atas menggunakan aplikasi Bank, GoPay, OVO, Dana, atau LinkAja Anda. Setelah membayar, upload screenshot bukti pembayaran di bawah agar kasir bisa memverifikasi lebih cepat.
                   </p>
+
+                  <div className="bg-white p-3 rounded-lg border border-dashed border-brand-badge-border space-y-2 text-left">
+                    <p className="text-[11px] font-bold text-slate-700">Sudah bayar? Upload bukti pembayaran</p>
+                    {currentOrder.hasPaymentProof && (
+                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-2 font-semibold">
+                        <Check size={14} className="flex-shrink-0" /> Bukti terkirim. Kasir akan memverifikasi pembayaran Anda.
+                      </div>
+                    )}
+                    {proofPreview?.orderId === currentOrder.id && (
+                      <img src={proofPreview.url} alt="Bukti bayar" className="w-full max-h-48 object-contain rounded-lg border border-slate-100 bg-slate-50" />
+                    )}
+                    <label className="block">
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        disabled={proofUploading}
+                        onChange={(e) => {
+                          handleUploadProof(e.target.files?.[0]);
+                          e.target.value = '';
+                        }}
+                      />
+                      <span className={`w-full inline-flex items-center justify-center gap-1.5 text-[11px] font-bold py-2 rounded-lg transition-all ${proofUploading ? 'bg-slate-200 text-slate-500 cursor-wait' : 'bg-brand-forest hover:bg-brand-deep text-white cursor-pointer'}`}>
+                        <Upload size={13} />
+                        {proofUploading ? 'Mengunggah...' : currentOrder.hasPaymentProof ? 'Ganti Bukti Bayar' : 'Pilih Screenshot Bukti Bayar'}
+                      </span>
+                    </label>
+                    {proofError && <p className="text-[11px] text-red-500 font-semibold">{proofError}</p>}
+                  </div>
                 </div>
               </>
             ) : (

@@ -457,6 +457,7 @@ interface DBState {
   menu: MenuItem[];
   orders: Order[];
   appLogs?: AppLog[];
+  proofs?: Record<string, { image: string; createdAt: string }>;
 }
 
 let dbState: DBState = {
@@ -1055,6 +1056,38 @@ app.get('/api/orders/:id', (req, res) => {
   res.json(order);
 });
 
+// Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
+const PROOF_MAX_CHARS = 500_000;
+const PROOF_REGEX = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+app.post('/api/orders/:id/proof', (req, res) => {
+  const { id } = req.params;
+  const image = req.body?.image;
+  if (typeof image !== 'string') return res.status(400).json({ error: 'Gambar bukti bayar wajib diisi' });
+  if (image.length > PROOF_MAX_CHARS) return res.status(413).json({ error: 'Ukuran gambar terlalu besar, gunakan screenshot yang lebih kecil' });
+  if (!PROOF_REGEX.test(image)) return res.status(400).json({ error: 'Format gambar tidak valid (gunakan JPG/PNG/WebP)' });
+  const order = dbState.orders.find(o => o.id === id);
+  if (!order) return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+  if (order.archivedAt) return res.status(400).json({ error: 'Pesanan sudah diarsipkan' });
+  if (order.paymentMethod !== 'qris') return res.status(400).json({ error: 'Bukti bayar hanya untuk pembayaran QRIS' });
+  if (order.status !== 'menunggu_verifikasi') return res.status(400).json({ error: 'Pesanan sudah diverifikasi, bukti bayar tidak dapat diubah' });
+  dbState.proofs = dbState.proofs || {};
+  dbState.proofs[id] = { image, createdAt: new Date().toISOString() };
+  order.hasPaymentProof = true;
+  saveDB();
+  notifyClientsRefresh();
+  logApp('INFO', `Bukti bayar diunggah: ${id} (meja ${order.tableNumber})`, { orderId: id, table: order.tableNumber });
+  res.json({ message: 'Bukti bayar berhasil dikirim' });
+});
+
+// Kasir/owner melihat bukti bayar
+app.get('/api/orders/:id/proof', authMiddleware, requireRole('owner', 'kasir', 'admin'), (req, res) => {
+  const proof = dbState.proofs?.[req.params.id];
+  if (!proof) return res.status(404).json({ error: 'Bukti bayar belum diunggah' });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(proof);
+});
+
 app.put('/api/orders/:id/status', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
@@ -1200,6 +1233,7 @@ app.delete('/api/orders/:id', authMiddleware, requireRole('owner', 'kasir'), (re
   }
 
   const deleted = dbState.orders.splice(orderIndex, 1);
+  if (dbState.proofs) delete dbState.proofs[id];
   saveDB();
   res.json({ message: "Pesanan berhasil dihapus", order: deleted[0] });
 });
