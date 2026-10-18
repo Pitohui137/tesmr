@@ -1,0 +1,274 @@
+diff --git a/server.ts b/server.ts
+index a57966c..8659f93 100644
+--- a/server.ts
++++ b/server.ts
+@@ -733,7 +733,7 @@ app.get('/api/menu', (req, res) => {
+   cachedJson(req, res, dbState.menu);
+ });
+ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+-  const { name, category, price, description, imageUrl, isAvailable, variants } = req.body;
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
+   if (!name || !category || price === undefined) {
+     return res.status(400).json({ error: "Nama, kategori, dan harga harus diisi" });
+   }
+@@ -746,6 +746,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res)
+     description: description || "",
+     imageUrl: imageUrl || "",
+     isAvailable: isAvailable !== undefined ? isAvailable : true,
++    isBestSeller: isBestSeller === true,
+     createdAt: new Date().toISOString(),
+     variants: Array.isArray(variants) && variants.length ? variants : undefined
+   };
+@@ -758,7 +759,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res)
+ 
+ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+   const { id } = req.params;
+-  const { name, category, price, description, imageUrl, isAvailable, variants } = req.body;
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
+ 
+   const itemIndex = dbState.menu.findIndex(m => m.id === id);
+ 
+@@ -769,8 +770,8 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+   const user = (req as any).user as JwtPayload;
+   if (user.role !== 'owner') {
+     const current = dbState.menu[itemIndex];
+-    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants };
+-    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants };
++    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller };
++    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller };
+     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
+       return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
+     }
+@@ -784,6 +785,7 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+     description: description !== undefined ? description : dbState.menu[itemIndex].description,
+     imageUrl: imageUrl !== undefined ? imageUrl : dbState.menu[itemIndex].imageUrl,
+     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
++    isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
+     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
+   };
+ 
+diff --git a/server/migrate-best-seller.sql b/server/migrate-best-seller.sql
+new file mode 100644
+index 0000000..14deee9
+--- /dev/null
++++ b/server/migrate-best-seller.sql
+@@ -0,0 +1,6 @@
++-- Migrasi: kolom penanda Best Seller pada tabel menu
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-best-seller.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-best-seller.sql
++-- Hanya dijalankan SEKALI pada database yang sudah ada (database baru sudah memakai schema.sql terbaru).
++
++ALTER TABLE menu ADD COLUMN is_best_seller INTEGER NOT NULL DEFAULT 0;
+diff --git a/server/schema.sql b/server/schema.sql
+index 9c76a2c..703250b 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS menu (
+   description TEXT NOT NULL DEFAULT '',
+   image_url TEXT NOT NULL DEFAULT '',
+   is_available INTEGER NOT NULL DEFAULT 1,
++  is_best_seller INTEGER NOT NULL DEFAULT 0,
+   variants TEXT NOT NULL DEFAULT '',
+   created_at TEXT NOT NULL
+ );
+diff --git a/server/worker.ts b/server/worker.ts
+index 4362ac0..b1f2c55 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -58,6 +58,7 @@ interface MenuRow {
+   description: string;
+   image_url: string;
+   is_available: number;
++  is_best_seller?: number;
+   variants: string;
+   created_at: string;
+ }
+@@ -206,6 +207,7 @@ function toMenu(m: MenuRow) {
+     description: m.description,
+     imageUrl: m.image_url,
+     isAvailable: !!m.is_available,
++    isBestSeller: !!m.is_best_seller,
+     createdAt: m.created_at,
+     variants: variants && variants.length ? variants : undefined,
+   };
+@@ -550,13 +552,13 @@ app.get('/api/menu', async (c) => {
+ });
+ 
+ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+-  const { name, category, price, description, imageUrl, isAvailable, variants } = await c.req.json().catch(() => ({}));
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
+   if (!name || !category || price === undefined) return c.json({ error: 'Nama, kategori, dan harga harus diisi' }, 400);
+   const id = `menu-${Date.now()}`;
+   const variantsStr = Array.isArray(variants) && variants.length ? JSON.stringify(variants) : '';
+   await c.env.DB.prepare(
+-    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+-  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, variantsStr, new Date().toISOString()).run();
++    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
++  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, variantsStr, new Date().toISOString()).run();
+   invalidateMenuCache();
+   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   return c.json({ message: 'Menu berhasil ditambahkan', item: toMenu(row!) }, 201);
+@@ -565,24 +567,25 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+ app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
+   const { id } = c.req.param();
+   const user = c.get('user') as { role: Role };
+-  const { name, category, price, description, imageUrl, isAvailable, variants } = await c.req.json().catch(() => ({}));
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
+ 
+   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
+ 
+-  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined)) {
++  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined)) {
+     return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
+   }
+ 
+   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
+   await c.env.DB.prepare(
+     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
+-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), variants = COALESCE(?, variants) WHERE id = ?'
++    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), variants = COALESCE(?, variants) WHERE id = ?'
+   ).bind(
+     name ?? null, category ?? null,
+     price !== undefined ? Number(price) : null,
+     description ?? null, imageUrl ?? null,
+     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
++    isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
+     variantsStr ?? null, id
+   ).run();
+   invalidateMenuCache();
+diff --git a/src/components/CustomerView.tsx b/src/components/CustomerView.tsx
+index 20981b1..05fc1ad 100644
+--- a/src/components/CustomerView.tsx
++++ b/src/components/CustomerView.tsx
+@@ -1,6 +1,6 @@
+ import React, { useState, useEffect, useRef } from 'react';
+ import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
+-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake } from 'lucide-react';
++import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame } from 'lucide-react';
+ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+ 
+ const CATEGORY_LABELS: Record<string, string> = {
+@@ -361,7 +361,8 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+   const filteredMenu = menu.filter(item => {
+     const matchesSearch = item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+       item.description.toLowerCase().includes(searchQuery.toLowerCase());
+-    const matchesCategory = activeCategory === 'semua' || item.category === activeCategory;
++    const matchesCategory = activeCategory === 'semua'
++      || (activeCategory === 'bestseller' ? !!item.isBestSeller : item.category === activeCategory);
+     return matchesSearch && matchesCategory;
+   });
+ 
+@@ -532,6 +533,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-none">
+             {[
+               { id: 'semua', label: 'Semua Menu' },
++              ...(menu.some(m => m.isBestSeller) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
+               { id: 'makanan', label: 'Food Menu' },
+               { id: 'kudapan', label: 'Kudapan' },
+               { id: 'dessert', label: 'Dessert' },
+@@ -599,6 +601,11 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                         }`}>
+                         {CATEGORY_LABELS[item.category] || item.category}
+                       </span>
++                      {item.isBestSeller && (
++                        <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] uppercase font-extrabold tracking-wider px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-sm">
++                          <Flame size={10} /> Best Seller
++                        </span>
++                      )}
+                     </div>
+                     <div className="p-2.5 space-y-1.5">
+                       <h3 className="font-bold text-slate-800 text-xs leading-tight line-clamp-2 min-h-[2rem]">{item.name}</h3>
+diff --git a/src/components/OwnerDashboard.tsx b/src/components/OwnerDashboard.tsx
+index 6869645..d33fb23 100644
+--- a/src/components/OwnerDashboard.tsx
++++ b/src/components/OwnerDashboard.tsx
+@@ -4,7 +4,7 @@ import {
+   TrendingUp, Users, Coffee, Settings, Plus, Edit, Trash2, Check, X, 
+   MapPin, Phone, CreditCard, DollarSign, BarChart2, Calendar, FileText, 
+   AlertCircle, ChevronRight, HelpCircle, Eye, Printer, LayoutGrid, CheckCircle2, Clock, RefreshCw,
+-  Smartphone, Monitor, Tablet, Bot, Server, Globe, ShieldCheck, Utensils, Cake, Cookie
++  Smartphone, Monitor, Tablet, Bot, Server, Globe, ShieldCheck, Utensils, Cake, Cookie, Flame
+ } from 'lucide-react';
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
+@@ -54,6 +54,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+   const [menuFormDescription, setMenuFormDescription] = useState<string>('');
+   const [menuFormImageUrl, setMenuFormImageUrl] = useState<string>('');
+   const [menuFormAvailable, setMenuFormAvailable] = useState<boolean>(true);
++  const [menuFormBestSeller, setMenuFormBestSeller] = useState<boolean>(false);
+   const [menuFormVariants, setMenuFormVariants] = useState<MenuVariant[]>([]);
+ 
+   // Report period state
+@@ -234,6 +235,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       setMenuFormDescription(item.description);
+       setMenuFormImageUrl(item.imageUrl);
+       setMenuFormAvailable(item.isAvailable);
++      setMenuFormBestSeller(!!item.isBestSeller);
+       setMenuFormVariants(item.variants?.length ? item.variants.map(v => ({ ...v })) : []);
+     } else {
+       setEditingMenuItem(null);
+@@ -243,6 +245,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       setMenuFormDescription('');
+       setMenuFormImageUrl('');
+       setMenuFormAvailable(true);
++      setMenuFormBestSeller(false);
+       setMenuFormVariants([]);
+     }
+     setIsMenuModalOpen(true);
+@@ -268,6 +271,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       description: menuFormDescription.trim(),
+       imageUrl: menuFormImageUrl.trim(),
+       isAvailable: menuFormAvailable,
++      isBestSeller: menuFormBestSeller,
+       variants: cleanVariants.length ? cleanVariants : undefined
+     };
+ 
+@@ -955,7 +959,14 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                   <div className="flex-1 flex flex-col justify-between min-w-0">
+                     <div>
+                       <div className="flex justify-between items-start gap-1">
+-                        <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">{item.name}</h4>
++                        <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">
++                          {item.name}
++                          {item.isBestSeller && (
++                            <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
++                              <Flame size={9} /> Best Seller
++                            </span>
++                          )}
++                        </h4>
+                         <span className={`text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded ${
+                           item.category === 'makanan' ? 'bg-red-50 text-red-600' :
+                           item.category === 'minuman' ? 'bg-blue-50 text-blue-600' :
+@@ -1778,6 +1789,19 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                   </label>
+                 </div>
+ 
++                <div className="flex items-center gap-2">
++                  <input
++                    type="checkbox"
++                    id="isBestSeller"
++                    checked={menuFormBestSeller}
++                    onChange={(e) => setMenuFormBestSeller(e.target.checked)}
++                    className="w-4 h-4 text-amber-500 border-slate-300 rounded focus:ring-amber-400"
++                  />
++                  <label htmlFor="isBestSeller" className="text-slate-700 font-bold select-none cursor-pointer">
++                    Tandai sebagai Best Seller
++                  </label>
++                </div>
++
+                 <div className="border-t border-slate-100 pt-4 flex justify-end gap-2">
+                   <button
+                     type="button"
+diff --git a/src/types.ts b/src/types.ts
+index 3d3ddc3..4943ef4 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -28,6 +28,7 @@ export interface MenuItem {
+   description: string;
+   imageUrl: string;
+   isAvailable: boolean;
++  isBestSeller?: boolean;
+   createdAt: string;
+   variants?: MenuVariant[];
+ }

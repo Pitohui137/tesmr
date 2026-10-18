@@ -4,7 +4,7 @@ import {
   TrendingUp, Users, Coffee, Settings, Plus, Edit, Trash2, Check, X, 
   MapPin, Phone, CreditCard, DollarSign, BarChart2, Calendar, FileText, 
   AlertCircle, ChevronRight, HelpCircle, Eye, Printer, LayoutGrid, CheckCircle2, Clock, RefreshCw,
-  Smartphone, Monitor, Tablet, Bot, Server, Globe, ShieldCheck, Utensils, Cake, Cookie
+  Smartphone, Monitor, Tablet, Bot, Server, Globe, ShieldCheck, Utensils, Cake, Cookie, Flame
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
@@ -54,6 +54,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
   const [menuFormDescription, setMenuFormDescription] = useState<string>('');
   const [menuFormImageUrl, setMenuFormImageUrl] = useState<string>('');
   const [menuFormAvailable, setMenuFormAvailable] = useState<boolean>(true);
+  const [menuFormBestSeller, setMenuFormBestSeller] = useState<boolean>(false);
   const [menuFormVariants, setMenuFormVariants] = useState<MenuVariant[]>([]);
 
   // Report period state
@@ -234,6 +235,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       setMenuFormDescription(item.description);
       setMenuFormImageUrl(item.imageUrl);
       setMenuFormAvailable(item.isAvailable);
+      setMenuFormBestSeller(!!item.isBestSeller);
       setMenuFormVariants(item.variants?.length ? item.variants.map(v => ({ ...v })) : []);
     } else {
       setEditingMenuItem(null);
@@ -243,6 +245,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       setMenuFormDescription('');
       setMenuFormImageUrl('');
       setMenuFormAvailable(true);
+      setMenuFormBestSeller(false);
       setMenuFormVariants([]);
     }
     setIsMenuModalOpen(true);
@@ -268,6 +271,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       description: menuFormDescription.trim(),
       imageUrl: menuFormImageUrl.trim(),
       isAvailable: menuFormAvailable,
+      isBestSeller: menuFormBestSeller,
       variants: cleanVariants.length ? cleanVariants : undefined
     };
 
@@ -955,7 +959,14 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                   <div className="flex-1 flex flex-col justify-between min-w-0">
                     <div>
                       <div className="flex justify-between items-start gap-1">
-                        <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">{item.name}</h4>
+                        <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">
+                          {item.name}
+                          {item.isBestSeller && (
+                            <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+                              <Flame size={9} /> Best Seller
+                            </span>
+                          )}
+                        </h4>
                         <span className={`text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded ${
                           item.category === 'makanan' ? 'bg-red-50 text-red-600' :
                           item.category === 'minuman' ? 'bg-blue-50 text-blue-600' :
@@ -1595,12 +1606,12 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       {/* MENU FORM MODAL */}
       <AnimatePresence>
         {isMenuModalOpen && (
-          <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+          <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center overflow-y-auto p-4">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl border border-slate-150"
+              className="bg-white rounded-2xl w-full max-w-md max-h-[90dvh] flex flex-col overflow-hidden shadow-2xl border border-slate-150"
             >
               <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center">
                 <span className="font-bold text-slate-800 text-xs uppercase tracking-wider flex items-center gap-1">
@@ -1614,7 +1625,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                 </button>
               </div>
 
-              <form onSubmit={handleSaveMenu} className="p-6 space-y-4 text-xs font-semibold">
+              <form onSubmit={handleSaveMenu} className="min-h-0 flex-1 overflow-y-auto p-6 space-y-4 text-xs font-semibold">
                 <div className="space-y-1.5">
                   <label className="text-slate-500 uppercase tracking-wider">Nama Menu</label>
                   <input
@@ -1775,6 +1786,19 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                   />
                   <label htmlFor="isAvailable" className="text-slate-700 font-bold select-none cursor-pointer">
                     Stok Tersedia (Aktifkan Menu)
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="isBestSeller"
+                    checked={menuFormBestSeller}
+                    onChange={(e) => setMenuFormBestSeller(e.target.checked)}
+                    className="w-4 h-4 text-amber-500 border-slate-300 rounded focus:ring-amber-400"
+                  />
+                  <label htmlFor="isBestSeller" className="text-slate-700 font-bold select-none cursor-pointer">
+                    Tandai sebagai Best Seller
                   </label>
                 </div>
 

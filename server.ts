@@ -733,7 +733,7 @@ app.get('/api/menu', (req, res) => {
   cachedJson(req, res, dbState.menu);
 });
 app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
-  const { name, category, price, description, imageUrl, isAvailable, variants } = req.body;
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
   if (!name || !category || price === undefined) {
     return res.status(400).json({ error: "Nama, kategori, dan harga harus diisi" });
   }
@@ -746,6 +746,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) 
     description: description || "",
     imageUrl: imageUrl || "",
     isAvailable: isAvailable !== undefined ? isAvailable : true,
+    isBestSeller: isBestSeller === true,
     createdAt: new Date().toISOString(),
     variants: Array.isArray(variants) && variants.length ? variants : undefined
   };
@@ -758,7 +759,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) 
 
 app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
   const { id } = req.params;
-  const { name, category, price, description, imageUrl, isAvailable, variants } = req.body;
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
 
   const itemIndex = dbState.menu.findIndex(m => m.id === id);
 
@@ -769,8 +770,8 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
   const user = (req as any).user as JwtPayload;
   if (user.role !== 'owner') {
     const current = dbState.menu[itemIndex];
-    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants };
-    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants };
+    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller };
+    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller };
     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
       return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
     }
@@ -784,6 +785,7 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
     description: description !== undefined ? description : dbState.menu[itemIndex].description,
     imageUrl: imageUrl !== undefined ? imageUrl : dbState.menu[itemIndex].imageUrl,
     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
+    isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
   };
 

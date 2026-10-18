@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS menu (
   description TEXT NOT NULL DEFAULT '',
   image_url TEXT NOT NULL DEFAULT '',
   is_available INTEGER NOT NULL DEFAULT 1,
+  is_best_seller INTEGER NOT NULL DEFAULT 0,
   variants TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );

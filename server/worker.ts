@@ -58,6 +58,7 @@ interface MenuRow {
   description: string;
   image_url: string;
   is_available: number;
+  is_best_seller?: number;
   variants: string;
   created_at: string;
 }
@@ -206,6 +207,7 @@ function toMenu(m: MenuRow) {
     description: m.description,
     imageUrl: m.image_url,
     isAvailable: !!m.is_available,
+    isBestSeller: !!m.is_best_seller,
     createdAt: m.created_at,
     variants: variants && variants.length ? variants : undefined,
   };
@@ -550,13 +552,13 @@ app.get('/api/menu', async (c) => {
 });
 
 app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
-  const { name, category, price, description, imageUrl, isAvailable, variants } = await c.req.json().catch(() => ({}));
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
   if (!name || !category || price === undefined) return c.json({ error: 'Nama, kategori, dan harga harus diisi' }, 400);
   const id = `menu-${Date.now()}`;
   const variantsStr = Array.isArray(variants) && variants.length ? JSON.stringify(variants) : '';
   await c.env.DB.prepare(
-    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, variantsStr, new Date().toISOString()).run();
+    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, variantsStr, new Date().toISOString()).run();
   invalidateMenuCache();
   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   return c.json({ message: 'Menu berhasil ditambahkan', item: toMenu(row!) }, 201);
@@ -565,24 +567,25 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
 app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
   const { id } = c.req.param();
   const user = c.get('user') as { role: Role };
-  const { name, category, price, description, imageUrl, isAvailable, variants } = await c.req.json().catch(() => ({}));
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
 
   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
 
-  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined)) {
+  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined)) {
     return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
   }
 
   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
   await c.env.DB.prepare(
     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), variants = COALESCE(?, variants) WHERE id = ?'
+    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), variants = COALESCE(?, variants) WHERE id = ?'
   ).bind(
     name ?? null, category ?? null,
     price !== undefined ? Number(price) : null,
     description ?? null, imageUrl ?? null,
     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
+    isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
     variantsStr ?? null, id
   ).run();
   invalidateMenuCache();

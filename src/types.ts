@@ -28,6 +28,7 @@ export interface MenuItem {
   description: string;
   imageUrl: string;
   isAvailable: boolean;
+  isBestSeller?: boolean;
   createdAt: string;
   variants?: MenuVariant[];
 }

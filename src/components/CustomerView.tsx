@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake } from 'lucide-react';
+import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -361,7 +361,8 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   const filteredMenu = menu.filter(item => {
     const matchesSearch = item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.description.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesCategory = activeCategory === 'semua' || item.category === activeCategory;
+    const matchesCategory = activeCategory === 'semua'
+      || (activeCategory === 'bestseller' ? !!item.isBestSeller : item.category === activeCategory);
     return matchesSearch && matchesCategory;
   });
 
@@ -532,6 +533,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-none">
             {[
               { id: 'semua', label: 'Semua Menu' },
+              ...(menu.some(m => m.isBestSeller) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
               { id: 'makanan', label: 'Food Menu' },
               { id: 'kudapan', label: 'Kudapan' },
               { id: 'dessert', label: 'Dessert' },
@@ -599,6 +601,11 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                         }`}>
                         {CATEGORY_LABELS[item.category] || item.category}
                       </span>
+                      {item.isBestSeller && (
+                        <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] uppercase font-extrabold tracking-wider px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-sm">
+                          <Flame size={10} /> Best Seller
+                        </span>
+                      )}
                     </div>
                     <div className="p-2.5 space-y-1.5">
                       <h3 className="font-bold text-slate-800 text-xs leading-tight line-clamp-2 min-h-[2rem]">{item.name}</h3>
