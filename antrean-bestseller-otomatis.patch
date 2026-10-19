@@ -1,0 +1,692 @@
+diff --git a/server.ts b/server.ts
+index aa65eb9..af682f4 100644
+--- a/server.ts
++++ b/server.ts
+@@ -4,6 +4,8 @@ import fs from 'fs';
+ import { createServer as createViteServer } from 'vite';
+ import { CafeSettings, MenuItem, Order, UserAccount, OrderItem, AppLog } from './src/types';
+ import { MENUS } from './server/menu-data';
++import { computeQueue, getOrderEta } from './src/utils/estimate';
++import { computeAutoBestSellers } from './src/utils/bestseller';
+ import Database from 'better-sqlite3';
+ import bcrypt from 'bcryptjs';
+ import jwt from 'jsonwebtoken';
+@@ -720,18 +722,40 @@ app.get('/api/settings', (req, res) => {
+ });
+ 
+ app.post('/api/settings', authMiddleware, requireRole('owner', 'admin'), (req, res) => {
+-  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl } = req.body;
++  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = req.body;
+   if (!name || !address || !phone) {
+     return res.status(400).json({ error: "Semua data cafe utama harus diisi!" });
+   }
+ 
+-  dbState.settings = { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl };
++  dbState.settings = {
++    name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl,
++    bestSellerAuto: bestSellerAuto !== undefined ? !!bestSellerAuto : !!dbState.settings.bestSellerAuto
++  };
++  bestSellerCache = null;
+   saveDB();
+   res.json({ message: "Pengaturan cafe berhasil diperbarui", settings: dbState.settings });
+ });
+ 
++// Best Seller otomatis (penjualan 30 hari terakhir), di-cache 60 detik
++let bestSellerCache: { ids: Set<string>; ts: number } | null = null;
++function menuForClients() {
++  if (!dbState.settings.bestSellerAuto) return dbState.menu;
++  if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
++    bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
++  }
++  const ids = bestSellerCache.ids;
++  return dbState.menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++}
++
+ app.get('/api/menu', (req, res) => {
+-  cachedJson(req, res, dbState.menu);
++  cachedJson(req, res, menuForClients());
++});
++
++// Publik: beban antrean saat ini (untuk estimasi di halaman checkout pelanggan)
++app.get('/api/queue', (req, res) => {
++  const now = Date.now();
++  const q = computeQueue(dbState.orders, dbState.menu, now);
++  res.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
+ });
+ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+   const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
+@@ -1053,6 +1077,10 @@ app.get('/api/orders/:id', (req, res) => {
+   if (!order) {
+     return res.status(404).json({ error: "Pesanan tidak ditemukan" });
+   }
++  if (order.status === 'diproses' || order.status === 'menunggu_verifikasi') {
++    const queue = computeQueue(dbState.orders, dbState.menu);
++    return res.json({ ...order, eta: getOrderEta(order, queue, dbState.menu) });
++  }
+   res.json(order);
+ });
+ 
+diff --git a/server/migrate-auto-bestseller.sql b/server/migrate-auto-bestseller.sql
+new file mode 100644
+index 0000000..97732b1
+--- /dev/null
++++ b/server/migrate-auto-bestseller.sql
+@@ -0,0 +1,7 @@
++-- Migrasi: pengaturan Best Seller otomatis (berdasarkan penjualan 30 hari terakhir)
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-auto-bestseller.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-auto-bestseller.sql
++-- Jalankan SEKALI pada database yang sudah ada, SEBELUM deploy kode baru.
++-- Jika muncul "duplicate column name: best_seller_auto", artinya sudah pernah dijalankan (aman diabaikan).
++
++ALTER TABLE settings ADD COLUMN best_seller_auto INTEGER NOT NULL DEFAULT 0;
+diff --git a/server/schema.sql b/server/schema.sql
+index 477a503..2620c79 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS settings (
+   phone TEXT NOT NULL DEFAULT '',
+   qris_merchant_name TEXT NOT NULL DEFAULT '',
+   qris_code_text TEXT NOT NULL DEFAULT '',
+-  qris_image_url TEXT NOT NULL DEFAULT ''
++  qris_image_url TEXT NOT NULL DEFAULT '',
++  best_seller_auto INTEGER NOT NULL DEFAULT 0
+ );
+ 
+ CREATE TABLE IF NOT EXISTS users (
+diff --git a/server/worker.ts b/server/worker.ts
+index d8ecdb0..2f3c990 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -1,6 +1,8 @@
+ import { Hono } from 'hono';
+ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+ import { SignJWT, jwtVerify } from 'jose';
++import { computeQueue, getOrderEta } from '../src/utils/estimate';
++import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
+ 
+ // ====== Minimal D1 / Workers types ======
+ interface D1PreparedStatement {
+@@ -49,6 +51,7 @@ interface SettingsRow {
+   qris_merchant_name: string;
+   qris_code_text: string;
+   qris_image_url: string;
++  best_seller_auto?: number;
+ }
+ 
+ interface MenuRow {
+@@ -265,6 +268,8 @@ const ORDERS_TTL = 800;
+ const menuCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
+ const settingsCache: { data: any | null; ts: number } = { data: null, ts: 0 };
+ const ordersCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
++const BEST_SELLER_TTL = 10 * 60 * 1000;
++const bestSellerCache: { ids: Set<string> | null; ts: number } = { ids: null, ts: 0 };
+ 
+ async function getMenuCached(db: D1Database): Promise<any[]> {
+   if (menuCache.data && Date.now() - menuCache.ts < MENU_TTL) return menuCache.data;
+@@ -274,7 +279,33 @@ async function getMenuCached(db: D1Database): Promise<any[]> {
+   return menuCache.data;
+ }
+ 
+-function invalidateMenuCache() { menuCache.data = null; }
++function invalidateMenuCache() { menuCache.data = null; bestSellerCache.ids = null; }
++
++// Best Seller otomatis: dihitung dari penjualan N hari terakhir, di-cache agar hemat query D1.
++async function getBestSellerIds(db: D1Database, menu: any[]): Promise<Set<string>> {
++  if (bestSellerCache.ids && Date.now() - bestSellerCache.ts < BEST_SELLER_TTL) return bestSellerCache.ids;
++  const since = new Date(Date.now() - BEST_SELLER_DAYS * 86400000).toISOString();
++  const rows = await db.prepare(
++    "SELECT items, status, created_at FROM orders WHERE status IN ('diproses','siap_diambil','selesai') AND created_at >= ?"
++  ).bind(since).all<{ items: string; status: string; created_at: string }>();
++  const orders = rows.results.map(r => {
++    let items: any[] = [];
++    try { items = JSON.parse(r.items); } catch {}
++    return { status: r.status, createdAt: r.created_at, items };
++  });
++  bestSellerCache.ids = new Set(computeAutoBestSellers(orders, menu));
++  bestSellerCache.ts = Date.now();
++  return bestSellerCache.ids;
++}
++
++// Menu untuk klien (pelanggan & dashboard): tambahkan penanda Best Seller otomatis bila diaktifkan.
++async function getMenuForClients(db: D1Database): Promise<any[]> {
++  const menu = await getMenuCached(db);
++  const settings = await getSettingsCached(db);
++  if (!settings.bestSellerAuto) return menu;
++  const ids = await getBestSellerIds(db, menu);
++  return menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++}
+ 
+ async function getSettingsCached(db: D1Database): Promise<any> {
+   if (settingsCache.data && Date.now() - settingsCache.ts < SETTINGS_TTL) return settingsCache.data;
+@@ -283,13 +314,14 @@ async function getSettingsCached(db: D1Database): Promise<any> {
+     ? {
+         name: row.name, address: row.address, phone: row.phone,
+         qrisMerchantName: row.qris_merchant_name, qrisCodeText: row.qris_code_text, qrisImageUrl: row.qris_image_url,
++        bestSellerAuto: !!row.best_seller_auto,
+       }
+-    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '' };
++    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '', bestSellerAuto: false };
+   settingsCache.ts = Date.now();
+   return settingsCache.data;
+ }
+ 
+-function invalidateSettingsCache() { settingsCache.data = null; }
++function invalidateSettingsCache() { settingsCache.data = null; bestSellerCache.ids = null; }
+ 
+ async function getOrdersCached(db: D1Database): Promise<any[]> {
+   if (ordersCache.data && Date.now() - ordersCache.ts < ORDERS_TTL) return ordersCache.data;
+@@ -540,20 +572,31 @@ app.get('/api/settings', async (c) => {
+ });
+ 
+ app.post('/api/settings', auth, requireRole('owner', 'admin'), async (c) => {
+-  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl } = await c.req.json().catch(() => ({}));
++  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = await c.req.json().catch(() => ({}));
+   if (!name || !address || !phone) return c.json({ error: 'Semua data cafe utama harus diisi!' }, 400);
++  const current = await getSettingsCached(c.env.DB);
++  const autoFlag = bestSellerAuto === undefined ? !!current.bestSellerAuto : !!bestSellerAuto;
+   await c.env.DB.prepare(
+-    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url) VALUES (1, ?, ?, ?, ?, ?, ?) ' +
++    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url, best_seller_auto) VALUES (1, ?, ?, ?, ?, ?, ?, ?) ' +
+     'ON CONFLICT(id) DO UPDATE SET name = excluded.name, address = excluded.address, phone = excluded.phone, ' +
+-    'qris_merchant_name = excluded.qris_merchant_name, qris_code_text = excluded.qris_code_text, qris_image_url = excluded.qris_image_url'
+-  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '').run();
++    'qris_merchant_name = excluded.qris_merchant_name, qris_code_text = excluded.qris_code_text, qris_image_url = excluded.qris_image_url, ' +
++    'best_seller_auto = excluded.best_seller_auto'
++  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '', autoFlag ? 1 : 0).run();
+   invalidateSettingsCache();
+   return c.json({ message: 'Pengaturan cafe berhasil diperbarui' });
+ });
+ 
+ // Menu
+ app.get('/api/menu', async (c) => {
+-  return c.json(await getMenuCached(c.env.DB));
++  return c.json(await getMenuForClients(c.env.DB));
++});
++
++// Publik: beban antrean saat ini (untuk estimasi di halaman checkout pelanggan)
++app.get('/api/queue', async (c) => {
++  const now = Date.now();
++  const [menu, all] = await Promise.all([getMenuCached(c.env.DB), getOrdersCached(c.env.DB)]);
++  const q = computeQueue(all, menu, now);
++  return c.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
+ });
+ 
+ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+@@ -758,7 +801,14 @@ app.get('/api/orders/:id', async (c) => {
+   const { id } = c.req.param();
+   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
+   if (!row) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
+-  return c.json(toOrder(row));
++  const order = toOrder(row);
++  if (order.status === 'diproses' || order.status === 'menunggu_verifikasi') {
++    const now = Date.now();
++    const [menu, all] = await Promise.all([getMenuCached(c.env.DB), getOrdersCached(c.env.DB)]);
++    const queue = computeQueue([...all.filter((o: any) => o.id !== id), order], menu, now);
++    return c.json({ ...order, eta: getOrderEta(order, queue, menu, now) });
++  }
++  return c.json(order);
+ });
+ 
+ // Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
+diff --git a/src/components/CashierDashboard.tsx b/src/components/CashierDashboard.tsx
+index 7ce738b..ca65f07 100644
+--- a/src/components/CashierDashboard.tsx
++++ b/src/components/CashierDashboard.tsx
+@@ -4,7 +4,7 @@ import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSoun
+ import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
+-import { estimateMinutes, formatClock } from '../utils/estimate';
++import { computeQueue, getOrderEta, formatClock } from '../utils/estimate';
+ 
+ interface CashierDashboardProps {
+   settings: CafeSettings;
+@@ -350,6 +350,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+   };
+ 
+   const todayStats = getTodayStats();
++  const queue = computeQueue(orders, menuItems, Date.now());
+ 
+   const getStatusBadge = (status: OrderStatus) => {
+     switch (status) {
+@@ -781,19 +782,17 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                     </div>
+ 
+                     {(order.status === 'menunggu_verifikasi' || order.status === 'diproses') && (() => {
+-                      const mins = estimateMinutes(order.items, menuItems);
+-                      if (mins <= 0) return null;
+-                      const readyAt = order.status === 'diproses' && order.processedAt
+-                        ? new Date(order.processedAt).getTime() + mins * 60000
+-                        : null;
+-                      const late = readyAt !== null && Date.now() > readyAt;
++                      const eta = getOrderEta(order, queue, menuItems, Date.now());
++                      if (!eta || eta.workMinutes <= 0) return null;
++                      const isProcessing = order.status === 'diproses';
++                      const late = isProcessing && Date.now() > eta.readyAt;
+                       return (
+-                        <div className={`flex justify-between items-center text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
+-                          <span className="flex items-center gap-1"><Clock size={12} /> Est. {mins} menit</span>
+-                          <span>
+-                            {readyAt
+-                              ? (late ? `Lewat target ${formatClock(readyAt)}` : `Target siap ${formatClock(readyAt)}`)
+-                              : 'Mulai dihitung setelah dikonfirmasi'}
++                        <div className={`flex justify-between items-center gap-2 text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
++                          <span className="flex items-center gap-1 flex-shrink-0"><Clock size={12} /> Est. {eta.workMinutes} menit</span>
++                          <span className="text-right">
++                            {isProcessing
++                              ? (late ? `Lewat target ${formatClock(eta.readyAt)}` : `Target siap ${formatClock(eta.readyAt)}${eta.ordersAhead > 0 ? ` • ${eta.ordersAhead} di depan` : ''}`)
++                              : `${eta.waitMinutes > 0 ? `Antrean ±${eta.waitMinutes} mnt • ` : ''}siap ${formatClock(eta.readyAt)} jika dikonfirmasi`}
+                           </span>
+                         </div>
+                       );
+diff --git a/src/components/CustomerView.tsx b/src/components/CustomerView.tsx
+index 65e68e4..8f5b63d 100644
+--- a/src/components/CustomerView.tsx
++++ b/src/components/CustomerView.tsx
+@@ -5,6 +5,8 @@ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+ import { compressImage } from '../utils/image';
+ import { estimateMinutes, formatClock } from '../utils/estimate';
+ 
++const isBestSellerItem = (m: { isBestSeller?: boolean; isAutoBestSeller?: boolean }) => !!(m.isBestSeller || m.isAutoBestSeller);
++
+ const CATEGORY_LABELS: Record<string, string> = {
+   makanan: 'Food Menu',
+   kudapan: 'Kudapan',
+@@ -82,6 +84,22 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+     return () => clearInterval(t);
+   }, []);
+ 
++  // Beban antrean saat ini (untuk estimasi di checkout)
++  const [queueLoad, setQueueLoad] = useState<{ waitMinutes: number; inQueue: number } | null>(null);
++  useEffect(() => {
++    if (!isCartOpen) return;
++    let cancelled = false;
++    const load = async () => {
++      try {
++        const r = await fetch('/api/queue');
++        if (r.ok && !cancelled) setQueueLoad(await r.json());
++      } catch { /* abaikan, estimasi tanpa antrean */ }
++    };
++    load();
++    const t = setInterval(load, 20000);
++    return () => { cancelled = true; clearInterval(t); };
++  }, [isCartOpen]);
++
+   // Upload bukti bayar QRIS
+   const [proofUploading, setProofUploading] = useState(false);
+   const [proofError, setProofError] = useState('');
+@@ -211,6 +229,23 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+       menu
+     );
+ 
++  const cartEstimateRow = (cls: string) => {
++    const work = getCartEstimate();
++    if (work <= 0) return null;
++    const wait = queueLoad?.waitMinutes || 0;
++    return (
++      <div className={cls}>
++        <div className="flex justify-between items-center text-xs text-slate-500">
++          <span className="flex items-center gap-1"><Clock size={12} /> Estimasi siap</span>
++          <span className="font-bold text-slate-700">±{work + wait} menit</span>
++        </div>
++        {wait > 0 && (
++          <p className="text-[10px] text-slate-400 text-right mt-0.5">Antrean saat ini ±{wait} menit + penyiapan ±{work} menit</p>
++        )}
++      </div>
++    );
++  };
++
+   const getCartItemCount = () => {
+     return Object.values(cart).reduce((sum, qty) => (sum as number) + (qty as number), 0) as number;
+   };
+@@ -411,7 +446,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+     const matchesSearch = item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+       item.description.toLowerCase().includes(searchQuery.toLowerCase());
+     const matchesCategory = activeCategory === 'semua'
+-      || (activeCategory === 'bestseller' ? !!item.isBestSeller : item.category === activeCategory);
++      || (activeCategory === 'bestseller' ? isBestSellerItem(item) : item.category === activeCategory);
+     return matchesSearch && matchesCategory;
+   });
+ 
+@@ -582,7 +617,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-none">
+             {[
+               { id: 'semua', label: 'Semua Menu' },
+-              ...(menu.some(m => m.isBestSeller) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
++              ...(menu.some(isBestSellerItem) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
+               { id: 'makanan', label: 'Food Menu' },
+               { id: 'kudapan', label: 'Kudapan' },
+               { id: 'dessert', label: 'Dessert' },
+@@ -650,7 +685,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                         }`}>
+                         {CATEGORY_LABELS[item.category] || item.category}
+                       </span>
+-                      {item.isBestSeller && (
++                      {isBestSellerItem(item) && (
+                         <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] uppercase font-extrabold tracking-wider px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-sm">
+                           <Flame size={10} /> Best Seller
+                         </span>
+@@ -894,12 +929,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     <span className="text-slate-500 font-semibold text-sm">Total Pembayaran</span>
+                     <span className="text-xl font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                   </div>
+-                  {getCartEstimate() > 0 && (
+-                    <div className="flex justify-between items-center text-xs text-slate-500 -mt-2 mb-4">
+-                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
+-                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
+-                    </div>
+-                  )}
++                  {cartEstimateRow('-mt-2 mb-4')}
+ 
+                   {error && (
+                     <div className="mb-3 p-3 bg-red-50 border border-red-100 text-red-700 rounded-xl text-xs flex items-center gap-2">
+@@ -979,12 +1009,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     <span className="text-slate-500 font-bold text-sm">Total Pembayaran</span>
+                     <span className="text-lg font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                   </div>
+-                  {getCartEstimate() > 0 && (
+-                    <div className="flex justify-between items-center text-xs text-slate-500">
+-                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
+-                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
+-                    </div>
+-                  )}
++                  {cartEstimateRow('')}
+                 </div>
+ 
+                 <div className="p-4 bg-slate-50 flex gap-2">
+@@ -1058,12 +1083,16 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Status Pesanan Anda</h3>
+ 
+             {(currentOrder.status === 'menunggu_verifikasi' || currentOrder.status === 'diproses') && (() => {
+-              const mins = estimateMinutes(currentOrder.items, menu);
++              const eta = currentOrder.eta;
++              const mins = eta ? eta.workMinutes : estimateMinutes(currentOrder.items, menu);
+               if (mins <= 0) return null;
+-              const readyAt = currentOrder.status === 'diproses' && currentOrder.processedAt
+-                ? new Date(currentOrder.processedAt).getTime() + mins * 60000
++              const isProcessing = currentOrder.status === 'diproses';
++              const readyAt = isProcessing
++                ? (eta?.readyAt ?? (currentOrder.processedAt ? new Date(currentOrder.processedAt).getTime() + mins * 60000 : null))
+                 : null;
+               const remaining = readyAt ? Math.max(0, Math.ceil((readyAt - nowTick) / 60000)) : null;
++              const wait = eta?.waitMinutes || 0;
++              const ahead = eta?.ordersAhead || 0;
+               return (
+                 <div className="mb-5 flex items-start gap-2.5 bg-white border border-brand-badge-border rounded-xl p-3">
+                   <Clock size={16} className="text-brand-forest flex-shrink-0 mt-0.5" />
+@@ -1075,12 +1104,16 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                           : 'Pesanan Anda sebentar lagi siap'}
+                       </p>
+                     ) : (
+-                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{mins} menit</p>
++                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{wait + mins} menit</p>
+                     )}
+                     <p className="text-[11px] text-slate-500 mt-0.5">
+                       {readyAt
+-                        ? `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`
+-                        : 'Dihitung sejak pembayaran Anda diverifikasi kasir.'}
++                        ? (ahead > 0
++                            ? `${ahead} pesanan lebih dulu di depan Anda, penyiapan pesanan Anda ±${mins} menit.`
++                            : `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`)
++                        : (wait > 0
++                            ? `Antrean ±${wait} menit + penyiapan ±${mins} menit, dihitung sejak pembayaran diverifikasi.`
++                            : 'Dihitung sejak pembayaran Anda diverifikasi kasir.')}
+                     </p>
+                   </div>
+                 </div>
+diff --git a/src/components/OwnerDashboard.tsx b/src/components/OwnerDashboard.tsx
+index 38bb7c4..adfa2eb 100644
+--- a/src/components/OwnerDashboard.tsx
++++ b/src/components/OwnerDashboard.tsx
+@@ -44,6 +44,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+   const [qrisMerchant, setQrisMerchant] = useState<string>(settings.qrisMerchantName);
+   const [qrisText, setQrisText] = useState<string>(settings.qrisCodeText);
+   const [qrisImageUrl, setQrisImageUrl] = useState<string>(settings.qrisImageUrl || '');
++  const [bestSellerAuto, setBestSellerAuto] = useState<boolean>(!!settings.bestSellerAuto);
+ 
+   // Modal / Form states for MENU CRUD
+   const [isMenuModalOpen, setIsMenuModalOpen] = useState<boolean>(false);
+@@ -461,7 +462,8 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+           phone: cafePhone.trim(),
+           qrisMerchantName: qrisMerchant.trim(),
+           qrisCodeText: qrisText.trim(),
+-          qrisImageUrl: qrisImageUrl.trim()
++          qrisImageUrl: qrisImageUrl.trim(),
++          bestSellerAuto
+         })
+       });
+ 
+@@ -961,9 +963,9 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                       <div className="flex justify-between items-start gap-1">
+                         <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">
+                           {item.name}
+-                          {item.isBestSeller && (
++                          {(item.isBestSeller || item.isAutoBestSeller) && (
+                             <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+-                              <Flame size={9} /> Best Seller
++                              <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
+                             </span>
+                           )}
+                         </h4>
+@@ -1283,6 +1285,24 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                 </div>
+               </div>
+ 
++              <div className="space-y-1.5 border-t border-slate-100 pt-5">
++                <div className="flex items-center gap-2">
++                  <input
++                    type="checkbox"
++                    id="bestSellerAuto"
++                    checked={bestSellerAuto}
++                    onChange={(e) => setBestSellerAuto(e.target.checked)}
++                    className="w-4 h-4 text-amber-500 border-slate-300 rounded focus:ring-amber-400"
++                  />
++                  <label htmlFor="bestSellerAuto" className="text-slate-700 font-bold select-none cursor-pointer">
++                    Best Seller otomatis
++                  </label>
++                </div>
++                <p className="text-[10px] text-slate-400 font-normal leading-normal">
++                  Menu terlaris per kategori (maks. 2 per kategori, minimal 5 terjual dalam 30 hari terakhir) otomatis mendapat badge Best Seller. Menu yang Anda tandai manual tetap menjadi Best Seller.
++                </p>
++              </div>
++
+               <div className="border-t border-slate-100 pt-5 text-right">
+                 <button
+                   type="submit"
+diff --git a/src/types.ts b/src/types.ts
+index a262282..ef6267a 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -29,6 +29,7 @@ export interface MenuItem {
+   imageUrl: string;
+   isAvailable: boolean;
+   isBestSeller?: boolean;
++  isAutoBestSeller?: boolean;
+   createdAt: string;
+   variants?: MenuVariant[];
+ }
+@@ -48,6 +49,14 @@ export interface OrderItem {
+ export type OrderStatus = 'menunggu_verifikasi' | 'diproses' | 'siap_diambil' | 'selesai' | 'dibatalkan';
+ export type PaymentMethod = 'qris' | 'cash';
+ 
++// Estimasi waktu penyiapan yang dihitung server (memperhitungkan antrean pesanan lain)
++export interface OrderEta {
++  workMinutes: number;   // waktu penyiapan pesanan ini sendiri
++  waitMinutes: number;   // menunggu antrean sebelum mulai dikerjakan
++  readyAt: number;       // perkiraan siap (epoch ms)
++  ordersAhead: number;   // jumlah pesanan diproses yang lebih dulu
++}
++
+ export interface Order {
+   id: string;
+   customerName: string;
+@@ -61,6 +70,7 @@ export interface Order {
+   archivedAt?: string;
+   hasPaymentProof?: boolean;
+   processedAt?: string;
++  eta?: OrderEta;
+ }
+ 
+ export interface CafeSettings {
+@@ -70,6 +80,7 @@ export interface CafeSettings {
+   qrisMerchantName: string;
+   qrisCodeText: string;
+   qrisImageUrl?: string;
++  bestSellerAuto?: boolean;
+ }
+ 
+ export interface ReportData {
+diff --git a/src/utils/bestseller.ts b/src/utils/bestseller.ts
+new file mode 100644
+index 0000000..c18bec8
+--- /dev/null
++++ b/src/utils/bestseller.ts
+@@ -0,0 +1,49 @@
++import type { MenuItem } from '../types';
++
++// Best Seller otomatis: menu terlaris per kategori dalam N hari terakhir.
++export const BEST_SELLER_DAYS = 30;
++export const BEST_SELLER_PER_CATEGORY = 2; // maksimal badge per kategori
++export const BEST_SELLER_MIN_QTY = 5;      // minimal terjual agar layak dapat badge
++// Hanya pesanan yang sudah dibayar/diverifikasi yang dihitung.
++export const BEST_SELLER_STATUSES = ['diproses', 'siap_diambil', 'selesai'];
++
++interface SaleOrder {
++  status: string;
++  createdAt: string;
++  items: { menuId: string; quantity: number; isCancelled?: boolean }[];
++}
++
++// Mengembalikan daftar id menu yang berstatus Best Seller otomatis.
++export function computeAutoBestSellers(
++  orders: SaleOrder[],
++  menu: Pick<MenuItem, 'id' | 'category'>[],
++  now = Date.now()
++): string[] {
++  const since = now - BEST_SELLER_DAYS * 86400000;
++  const sold = new Map<string, number>();
++  for (const o of orders) {
++    if (!BEST_SELLER_STATUSES.includes(o.status)) continue;
++    const t = Date.parse(o.createdAt);
++    if (!(t >= since)) continue;
++    for (const it of o.items || []) {
++      if (it.isCancelled) continue;
++      sold.set(it.menuId, (sold.get(it.menuId) || 0) + (Number(it.quantity) || 0));
++    }
++  }
++
++  const byCategory = new Map<string, { id: string; qty: number }[]>();
++  for (const m of menu) {
++    const qty = sold.get(m.id) || 0;
++    if (qty < BEST_SELLER_MIN_QTY) continue;
++    const list = byCategory.get(m.category) || [];
++    list.push({ id: m.id, qty });
++    byCategory.set(m.category, list);
++  }
++
++  const result: string[] = [];
++  for (const list of byCategory.values()) {
++    list.sort((a, b) => b.qty - a.qty);
++    result.push(...list.slice(0, BEST_SELLER_PER_CATEGORY).map(x => x.id));
++  }
++  return result;
++}
+diff --git a/src/utils/estimate.ts b/src/utils/estimate.ts
+index 74c4ce1..3f6de23 100644
+--- a/src/utils/estimate.ts
++++ b/src/utils/estimate.ts
+@@ -1,4 +1,4 @@
+-import { MenuItem } from '../types';
++import type { MenuItem, OrderEta } from '../types';
+ 
+ // Estimasi waktu penyiapan per item (menit), menurut kategori menu.
+ // Minuman 1 menit; makanan, kudapan, dan dessert masing-masing 3 menit.
+@@ -10,6 +10,12 @@ export const MINUTES_PER_ITEM: Record<string, number> = {
+ };
+ const DEFAULT_MINUTES = 3; // menu yang sudah dihapus / kategori tak dikenal
+ 
++// Jumlah petugas yang mengerjakan pesanan secara bersamaan (barista/koki).
++// 1 = pesanan dikerjakan berurutan. Naikkan jika cafe punya beberapa petugas.
++export const KITCHEN_WORKERS = 1;
++
++const MIN = 60000;
++
+ interface EstimateItem {
+   menuId: string;
+   quantity: number;
+@@ -29,3 +35,75 @@ export function estimateMinutes(items: EstimateItem[], menu: MenuItem[]): number
+ export function formatClock(ms: number): string {
+   return new Date(ms).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+ }
++
++// ===== Antrean =====
++export interface QueueOrder {
++  id: string;
++  status: string;
++  items: EstimateItem[];
++  createdAt: string;
++  processedAt?: string;
++  archivedAt?: string;
++}
++
++export interface QueueState {
++  etas: Record<string, OrderEta>; // untuk pesanan berstatus 'diproses'
++  busyUntil: number;              // kapan petugas paling awal bebas (epoch ms, minimal sekarang)
++  inQueue: number;                // jumlah pesanan 'diproses'
++}
++
++const toMs = (iso?: string) => {
++  const t = iso ? Date.parse(iso) : NaN;
++  return Number.isFinite(t) ? t : 0;
++};
++
++// Simulasi antrean: pesanan 'diproses' dikerjakan berurutan menurut waktu mulai (processedAt).
++// Pesanan baru mulai setelah petugas bebas. Pesanan yang sudah lewat target tapi belum
++// ditandai siap dianggap petugas masih sibuk sampai sekarang.
++export function computeQueue(
++  orders: QueueOrder[],
++  menu: MenuItem[],
++  now = Date.now(),
++  workers = KITCHEN_WORKERS
++): QueueState {
++  const free: number[] = new Array(Math.max(1, workers)).fill(0);
++  const active = orders
++    .filter(o => o.status === 'diproses' && !o.archivedAt)
++    .sort((a, b) => toMs(a.processedAt || a.createdAt) - toMs(b.processedAt || b.createdAt));
++
++  const etas: Record<string, OrderEta> = {};
++  active.forEach((o, idx) => {
++    let w = 0;
++    for (let i = 1; i < free.length; i++) if (free[i] < free[w]) w = i;
++    const workMinutes = estimateMinutes(o.items, menu);
++    const startAt = Math.max(toMs(o.processedAt || o.createdAt), free[w]);
++    const readyAt = startAt + workMinutes * MIN;
++    etas[o.id] = {
++      workMinutes,
++      waitMinutes: Math.max(0, Math.ceil((startAt - now) / MIN)),
++      readyAt,
++      ordersAhead: idx,
++    };
++    free[w] = Math.max(readyAt, now);
++  });
++
++  return { etas, busyUntil: Math.max(now, Math.min(...free)), inQueue: active.length };
++}
++
++// ETA satu pesanan. Pesanan 'menunggu_verifikasi' dihitung seolah dikonfirmasi sekarang.
++export function getOrderEta(
++  order: QueueOrder,
++  queue: QueueState,
++  menu: MenuItem[],
++  now = Date.now()
++): OrderEta | null {
++  if (order.status === 'diproses') return queue.etas[order.id] ?? null;
++  if (order.status !== 'menunggu_verifikasi') return null;
++  const workMinutes = estimateMinutes(order.items, menu);
++  return {
++    workMinutes,
++    waitMinutes: Math.max(0, Math.ceil((queue.busyUntil - now) / MIN)),
++    readyAt: queue.busyUntil + workMinutes * MIN,
++    ordersAhead: queue.inQueue,
++  };
++}

@@ -4,6 +4,8 @@ import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { CafeSettings, MenuItem, Order, UserAccount, OrderItem, AppLog } from './src/types';
 import { MENUS } from './server/menu-data';
+import { computeQueue, getOrderEta } from './src/utils/estimate';
+import { computeAutoBestSellers } from './src/utils/bestseller';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -720,18 +722,40 @@ app.get('/api/settings', (req, res) => {
 });
 
 app.post('/api/settings', authMiddleware, requireRole('owner', 'admin'), (req, res) => {
-  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl } = req.body;
+  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = req.body;
   if (!name || !address || !phone) {
     return res.status(400).json({ error: "Semua data cafe utama harus diisi!" });
   }
 
-  dbState.settings = { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl };
+  dbState.settings = {
+    name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl,
+    bestSellerAuto: bestSellerAuto !== undefined ? !!bestSellerAuto : !!dbState.settings.bestSellerAuto
+  };
+  bestSellerCache = null;
   saveDB();
   res.json({ message: "Pengaturan cafe berhasil diperbarui", settings: dbState.settings });
 });
 
+// Best Seller otomatis (penjualan 30 hari terakhir), di-cache 60 detik
+let bestSellerCache: { ids: Set<string>; ts: number } | null = null;
+function menuForClients() {
+  if (!dbState.settings.bestSellerAuto) return dbState.menu;
+  if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
+    bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
+  }
+  const ids = bestSellerCache.ids;
+  return dbState.menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+}
+
 app.get('/api/menu', (req, res) => {
-  cachedJson(req, res, dbState.menu);
+  cachedJson(req, res, menuForClients());
+});
+
+// Publik: beban antrean saat ini (untuk estimasi di halaman checkout pelanggan)
+app.get('/api/queue', (req, res) => {
+  const now = Date.now();
+  const q = computeQueue(dbState.orders, dbState.menu, now);
+  res.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
 });
 app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
   const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
@@ -1052,6 +1076,10 @@ app.get('/api/orders/:id', (req, res) => {
   const order = dbState.orders.find(o => o.id === id);
   if (!order) {
     return res.status(404).json({ error: "Pesanan tidak ditemukan" });
+  }
+  if (order.status === 'diproses' || order.status === 'menunggu_verifikasi') {
+    const queue = computeQueue(dbState.orders, dbState.menu);
+    return res.json({ ...order, eta: getOrderEta(order, queue, dbState.menu) });
   }
   res.json(order);
 });

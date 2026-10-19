@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { SignJWT, jwtVerify } from 'jose';
+import { computeQueue, getOrderEta } from '../src/utils/estimate';
+import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
 
 // ====== Minimal D1 / Workers types ======
 interface D1PreparedStatement {
@@ -49,6 +51,7 @@ interface SettingsRow {
   qris_merchant_name: string;
   qris_code_text: string;
   qris_image_url: string;
+  best_seller_auto?: number;
 }
 
 interface MenuRow {
@@ -265,6 +268,8 @@ const ORDERS_TTL = 800;
 const menuCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
 const settingsCache: { data: any | null; ts: number } = { data: null, ts: 0 };
 const ordersCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
+const BEST_SELLER_TTL = 10 * 60 * 1000;
+const bestSellerCache: { ids: Set<string> | null; ts: number } = { ids: null, ts: 0 };
 
 async function getMenuCached(db: D1Database): Promise<any[]> {
   if (menuCache.data && Date.now() - menuCache.ts < MENU_TTL) return menuCache.data;
@@ -274,7 +279,33 @@ async function getMenuCached(db: D1Database): Promise<any[]> {
   return menuCache.data;
 }
 
-function invalidateMenuCache() { menuCache.data = null; }
+function invalidateMenuCache() { menuCache.data = null; bestSellerCache.ids = null; }
+
+// Best Seller otomatis: dihitung dari penjualan N hari terakhir, di-cache agar hemat query D1.
+async function getBestSellerIds(db: D1Database, menu: any[]): Promise<Set<string>> {
+  if (bestSellerCache.ids && Date.now() - bestSellerCache.ts < BEST_SELLER_TTL) return bestSellerCache.ids;
+  const since = new Date(Date.now() - BEST_SELLER_DAYS * 86400000).toISOString();
+  const rows = await db.prepare(
+    "SELECT items, status, created_at FROM orders WHERE status IN ('diproses','siap_diambil','selesai') AND created_at >= ?"
+  ).bind(since).all<{ items: string; status: string; created_at: string }>();
+  const orders = rows.results.map(r => {
+    let items: any[] = [];
+    try { items = JSON.parse(r.items); } catch {}
+    return { status: r.status, createdAt: r.created_at, items };
+  });
+  bestSellerCache.ids = new Set(computeAutoBestSellers(orders, menu));
+  bestSellerCache.ts = Date.now();
+  return bestSellerCache.ids;
+}
+
+// Menu untuk klien (pelanggan & dashboard): tambahkan penanda Best Seller otomatis bila diaktifkan.
+async function getMenuForClients(db: D1Database): Promise<any[]> {
+  const menu = await getMenuCached(db);
+  const settings = await getSettingsCached(db);
+  if (!settings.bestSellerAuto) return menu;
+  const ids = await getBestSellerIds(db, menu);
+  return menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+}
 
 async function getSettingsCached(db: D1Database): Promise<any> {
   if (settingsCache.data && Date.now() - settingsCache.ts < SETTINGS_TTL) return settingsCache.data;
@@ -283,13 +314,14 @@ async function getSettingsCached(db: D1Database): Promise<any> {
     ? {
         name: row.name, address: row.address, phone: row.phone,
         qrisMerchantName: row.qris_merchant_name, qrisCodeText: row.qris_code_text, qrisImageUrl: row.qris_image_url,
+        bestSellerAuto: !!row.best_seller_auto,
       }
-    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '' };
+    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '', bestSellerAuto: false };
   settingsCache.ts = Date.now();
   return settingsCache.data;
 }
 
-function invalidateSettingsCache() { settingsCache.data = null; }
+function invalidateSettingsCache() { settingsCache.data = null; bestSellerCache.ids = null; }
 
 async function getOrdersCached(db: D1Database): Promise<any[]> {
   if (ordersCache.data && Date.now() - ordersCache.ts < ORDERS_TTL) return ordersCache.data;
@@ -540,20 +572,31 @@ app.get('/api/settings', async (c) => {
 });
 
 app.post('/api/settings', auth, requireRole('owner', 'admin'), async (c) => {
-  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl } = await c.req.json().catch(() => ({}));
+  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = await c.req.json().catch(() => ({}));
   if (!name || !address || !phone) return c.json({ error: 'Semua data cafe utama harus diisi!' }, 400);
+  const current = await getSettingsCached(c.env.DB);
+  const autoFlag = bestSellerAuto === undefined ? !!current.bestSellerAuto : !!bestSellerAuto;
   await c.env.DB.prepare(
-    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url) VALUES (1, ?, ?, ?, ?, ?, ?) ' +
+    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url, best_seller_auto) VALUES (1, ?, ?, ?, ?, ?, ?, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET name = excluded.name, address = excluded.address, phone = excluded.phone, ' +
-    'qris_merchant_name = excluded.qris_merchant_name, qris_code_text = excluded.qris_code_text, qris_image_url = excluded.qris_image_url'
-  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '').run();
+    'qris_merchant_name = excluded.qris_merchant_name, qris_code_text = excluded.qris_code_text, qris_image_url = excluded.qris_image_url, ' +
+    'best_seller_auto = excluded.best_seller_auto'
+  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '', autoFlag ? 1 : 0).run();
   invalidateSettingsCache();
   return c.json({ message: 'Pengaturan cafe berhasil diperbarui' });
 });
 
 // Menu
 app.get('/api/menu', async (c) => {
-  return c.json(await getMenuCached(c.env.DB));
+  return c.json(await getMenuForClients(c.env.DB));
+});
+
+// Publik: beban antrean saat ini (untuk estimasi di halaman checkout pelanggan)
+app.get('/api/queue', async (c) => {
+  const now = Date.now();
+  const [menu, all] = await Promise.all([getMenuCached(c.env.DB), getOrdersCached(c.env.DB)]);
+  const q = computeQueue(all, menu, now);
+  return c.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
 });
 
 app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
@@ -758,7 +801,14 @@ app.get('/api/orders/:id', async (c) => {
   const { id } = c.req.param();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   if (!row) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
-  return c.json(toOrder(row));
+  const order = toOrder(row);
+  if (order.status === 'diproses' || order.status === 'menunggu_verifikasi') {
+    const now = Date.now();
+    const [menu, all] = await Promise.all([getMenuCached(c.env.DB), getOrdersCached(c.env.DB)]);
+    const queue = computeQueue([...all.filter((o: any) => o.id !== id), order], menu, now);
+    return c.json({ ...order, eta: getOrderEta(order, queue, menu, now) });
+  }
+  return c.json(order);
 });
 
 // Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).

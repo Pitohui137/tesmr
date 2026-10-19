@@ -29,6 +29,7 @@ export interface MenuItem {
   imageUrl: string;
   isAvailable: boolean;
   isBestSeller?: boolean;
+  isAutoBestSeller?: boolean;
   createdAt: string;
   variants?: MenuVariant[];
 }
@@ -48,6 +49,14 @@ export interface OrderItem {
 export type OrderStatus = 'menunggu_verifikasi' | 'diproses' | 'siap_diambil' | 'selesai' | 'dibatalkan';
 export type PaymentMethod = 'qris' | 'cash';
 
+// Estimasi waktu penyiapan yang dihitung server (memperhitungkan antrean pesanan lain)
+export interface OrderEta {
+  workMinutes: number;   // waktu penyiapan pesanan ini sendiri
+  waitMinutes: number;   // menunggu antrean sebelum mulai dikerjakan
+  readyAt: number;       // perkiraan siap (epoch ms)
+  ordersAhead: number;   // jumlah pesanan diproses yang lebih dulu
+}
+
 export interface Order {
   id: string;
   customerName: string;
@@ -61,6 +70,7 @@ export interface Order {
   archivedAt?: string;
   hasPaymentProof?: boolean;
   processedAt?: string;
+  eta?: OrderEta;
 }
 
 export interface CafeSettings {
@@ -70,6 +80,7 @@ export interface CafeSettings {
   qrisMerchantName: string;
   qrisCodeText: string;
   qrisImageUrl?: string;
+  bestSellerAuto?: boolean;
 }
 
 export interface ReportData {

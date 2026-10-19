@@ -4,7 +4,7 @@ import { playNotificationOrCustomSound, initAudio, getCustomSound, setCustomSoun
 import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, UserCheck, DollarSign, Printer, X, Bell, Volume2, Search, ArrowRight, Trash2, Plus, AlertCircle, Image as ImageIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
-import { estimateMinutes, formatClock } from '../utils/estimate';
+import { computeQueue, getOrderEta, formatClock } from '../utils/estimate';
 
 interface CashierDashboardProps {
   settings: CafeSettings;
@@ -350,6 +350,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
   };
 
   const todayStats = getTodayStats();
+  const queue = computeQueue(orders, menuItems, Date.now());
 
   const getStatusBadge = (status: OrderStatus) => {
     switch (status) {
@@ -781,19 +782,17 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                     </div>
 
                     {(order.status === 'menunggu_verifikasi' || order.status === 'diproses') && (() => {
-                      const mins = estimateMinutes(order.items, menuItems);
-                      if (mins <= 0) return null;
-                      const readyAt = order.status === 'diproses' && order.processedAt
-                        ? new Date(order.processedAt).getTime() + mins * 60000
-                        : null;
-                      const late = readyAt !== null && Date.now() > readyAt;
+                      const eta = getOrderEta(order, queue, menuItems, Date.now());
+                      if (!eta || eta.workMinutes <= 0) return null;
+                      const isProcessing = order.status === 'diproses';
+                      const late = isProcessing && Date.now() > eta.readyAt;
                       return (
-                        <div className={`flex justify-between items-center text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
-                          <span className="flex items-center gap-1"><Clock size={12} /> Est. {mins} menit</span>
-                          <span>
-                            {readyAt
-                              ? (late ? `Lewat target ${formatClock(readyAt)}` : `Target siap ${formatClock(readyAt)}`)
-                              : 'Mulai dihitung setelah dikonfirmasi'}
+                        <div className={`flex justify-between items-center gap-2 text-[10px] font-bold px-2 py-1.5 rounded-lg border ${late ? 'bg-red-50 border-red-200 text-red-600' : 'bg-sky-50 border-sky-200 text-sky-700'}`}>
+                          <span className="flex items-center gap-1 flex-shrink-0"><Clock size={12} /> Est. {eta.workMinutes} menit</span>
+                          <span className="text-right">
+                            {isProcessing
+                              ? (late ? `Lewat target ${formatClock(eta.readyAt)}` : `Target siap ${formatClock(eta.readyAt)}${eta.ordersAhead > 0 ? ` • ${eta.ordersAhead} di depan` : ''}`)
+                              : `${eta.waitMinutes > 0 ? `Antrean ±${eta.waitMinutes} mnt • ` : ''}siap ${formatClock(eta.readyAt)} jika dikonfirmasi`}
                           </span>
                         </div>
                       );

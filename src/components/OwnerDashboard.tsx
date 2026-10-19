@@ -44,6 +44,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
   const [qrisMerchant, setQrisMerchant] = useState<string>(settings.qrisMerchantName);
   const [qrisText, setQrisText] = useState<string>(settings.qrisCodeText);
   const [qrisImageUrl, setQrisImageUrl] = useState<string>(settings.qrisImageUrl || '');
+  const [bestSellerAuto, setBestSellerAuto] = useState<boolean>(!!settings.bestSellerAuto);
 
   // Modal / Form states for MENU CRUD
   const [isMenuModalOpen, setIsMenuModalOpen] = useState<boolean>(false);
@@ -461,7 +462,8 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
           phone: cafePhone.trim(),
           qrisMerchantName: qrisMerchant.trim(),
           qrisCodeText: qrisText.trim(),
-          qrisImageUrl: qrisImageUrl.trim()
+          qrisImageUrl: qrisImageUrl.trim(),
+          bestSellerAuto
         })
       });
 
@@ -961,9 +963,9 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                       <div className="flex justify-between items-start gap-1">
                         <h4 className="font-bold text-slate-800 text-sm leading-tight truncate">
                           {item.name}
-                          {item.isBestSeller && (
+                          {(item.isBestSeller || item.isAutoBestSeller) && (
                             <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
-                              <Flame size={9} /> Best Seller
+                              <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
                             </span>
                           )}
                         </h4>
@@ -1281,6 +1283,24 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                     *Masukkan data payload QRIS Statis merchant Anda dari Bank/E-Wallet. Sistem akan otomatis merekonstruksinya menjadi QR Code yang siap discan pelanggan.
                   </p>
                 </div>
+              </div>
+
+              <div className="space-y-1.5 border-t border-slate-100 pt-5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="bestSellerAuto"
+                    checked={bestSellerAuto}
+                    onChange={(e) => setBestSellerAuto(e.target.checked)}
+                    className="w-4 h-4 text-amber-500 border-slate-300 rounded focus:ring-amber-400"
+                  />
+                  <label htmlFor="bestSellerAuto" className="text-slate-700 font-bold select-none cursor-pointer">
+                    Best Seller otomatis
+                  </label>
+                </div>
+                <p className="text-[10px] text-slate-400 font-normal leading-normal">
+                  Menu terlaris per kategori (maks. 2 per kategori, minimal 5 terjual dalam 30 hari terakhir) otomatis mendapat badge Best Seller. Menu yang Anda tandai manual tetap menjadi Best Seller.
+                </p>
               </div>
 
               <div className="border-t border-slate-100 pt-5 text-right">

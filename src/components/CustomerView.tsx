@@ -5,6 +5,8 @@ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 import { compressImage } from '../utils/image';
 import { estimateMinutes, formatClock } from '../utils/estimate';
 
+const isBestSellerItem = (m: { isBestSeller?: boolean; isAutoBestSeller?: boolean }) => !!(m.isBestSeller || m.isAutoBestSeller);
+
 const CATEGORY_LABELS: Record<string, string> = {
   makanan: 'Food Menu',
   kudapan: 'Kudapan',
@@ -81,6 +83,22 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
     const t = setInterval(() => setNowTick(Date.now()), 30000);
     return () => clearInterval(t);
   }, []);
+
+  // Beban antrean saat ini (untuk estimasi di checkout)
+  const [queueLoad, setQueueLoad] = useState<{ waitMinutes: number; inQueue: number } | null>(null);
+  useEffect(() => {
+    if (!isCartOpen) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await fetch('/api/queue');
+        if (r.ok && !cancelled) setQueueLoad(await r.json());
+      } catch { /* abaikan, estimasi tanpa antrean */ }
+    };
+    load();
+    const t = setInterval(load, 20000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [isCartOpen]);
 
   // Upload bukti bayar QRIS
   const [proofUploading, setProofUploading] = useState(false);
@@ -210,6 +228,23 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
       Object.entries(cart).map(([key, qty]) => ({ menuId: key.split('::')[0], quantity: qty as number })),
       menu
     );
+
+  const cartEstimateRow = (cls: string) => {
+    const work = getCartEstimate();
+    if (work <= 0) return null;
+    const wait = queueLoad?.waitMinutes || 0;
+    return (
+      <div className={cls}>
+        <div className="flex justify-between items-center text-xs text-slate-500">
+          <span className="flex items-center gap-1"><Clock size={12} /> Estimasi siap</span>
+          <span className="font-bold text-slate-700">±{work + wait} menit</span>
+        </div>
+        {wait > 0 && (
+          <p className="text-[10px] text-slate-400 text-right mt-0.5">Antrean saat ini ±{wait} menit + penyiapan ±{work} menit</p>
+        )}
+      </div>
+    );
+  };
 
   const getCartItemCount = () => {
     return Object.values(cart).reduce((sum, qty) => (sum as number) + (qty as number), 0) as number;
@@ -411,7 +446,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
     const matchesSearch = item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.description.toLowerCase().includes(searchQuery.toLowerCase());
     const matchesCategory = activeCategory === 'semua'
-      || (activeCategory === 'bestseller' ? !!item.isBestSeller : item.category === activeCategory);
+      || (activeCategory === 'bestseller' ? isBestSellerItem(item) : item.category === activeCategory);
     return matchesSearch && matchesCategory;
   });
 
@@ -582,7 +617,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
           <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-none">
             {[
               { id: 'semua', label: 'Semua Menu' },
-              ...(menu.some(m => m.isBestSeller) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
+              ...(menu.some(isBestSellerItem) ? [{ id: 'bestseller', label: '🔥 Best Seller' }] : []),
               { id: 'makanan', label: 'Food Menu' },
               { id: 'kudapan', label: 'Kudapan' },
               { id: 'dessert', label: 'Dessert' },
@@ -650,7 +685,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                         }`}>
                         {CATEGORY_LABELS[item.category] || item.category}
                       </span>
-                      {item.isBestSeller && (
+                      {isBestSellerItem(item) && (
                         <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] uppercase font-extrabold tracking-wider px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-sm">
                           <Flame size={10} /> Best Seller
                         </span>
@@ -894,12 +929,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     <span className="text-slate-500 font-semibold text-sm">Total Pembayaran</span>
                     <span className="text-xl font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
                   </div>
-                  {getCartEstimate() > 0 && (
-                    <div className="flex justify-between items-center text-xs text-slate-500 -mt-2 mb-4">
-                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
-                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
-                    </div>
-                  )}
+                  {cartEstimateRow('-mt-2 mb-4')}
 
                   {error && (
                     <div className="mb-3 p-3 bg-red-50 border border-red-100 text-red-700 rounded-xl text-xs flex items-center gap-2">
@@ -979,12 +1009,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     <span className="text-slate-500 font-bold text-sm">Total Pembayaran</span>
                     <span className="text-lg font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
                   </div>
-                  {getCartEstimate() > 0 && (
-                    <div className="flex justify-between items-center text-xs text-slate-500">
-                      <span className="flex items-center gap-1"><Clock size={12} /> Estimasi penyiapan</span>
-                      <span className="font-bold text-slate-700">±{getCartEstimate()} menit</span>
-                    </div>
-                  )}
+                  {cartEstimateRow('')}
                 </div>
 
                 <div className="p-4 bg-slate-50 flex gap-2">
@@ -1058,12 +1083,16 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4">Status Pesanan Anda</h3>
 
             {(currentOrder.status === 'menunggu_verifikasi' || currentOrder.status === 'diproses') && (() => {
-              const mins = estimateMinutes(currentOrder.items, menu);
+              const eta = currentOrder.eta;
+              const mins = eta ? eta.workMinutes : estimateMinutes(currentOrder.items, menu);
               if (mins <= 0) return null;
-              const readyAt = currentOrder.status === 'diproses' && currentOrder.processedAt
-                ? new Date(currentOrder.processedAt).getTime() + mins * 60000
+              const isProcessing = currentOrder.status === 'diproses';
+              const readyAt = isProcessing
+                ? (eta?.readyAt ?? (currentOrder.processedAt ? new Date(currentOrder.processedAt).getTime() + mins * 60000 : null))
                 : null;
               const remaining = readyAt ? Math.max(0, Math.ceil((readyAt - nowTick) / 60000)) : null;
+              const wait = eta?.waitMinutes || 0;
+              const ahead = eta?.ordersAhead || 0;
               return (
                 <div className="mb-5 flex items-start gap-2.5 bg-white border border-brand-badge-border rounded-xl p-3">
                   <Clock size={16} className="text-brand-forest flex-shrink-0 mt-0.5" />
@@ -1075,12 +1104,16 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                           : 'Pesanan Anda sebentar lagi siap'}
                       </p>
                     ) : (
-                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{mins} menit</p>
+                      <p className="text-sm font-extrabold text-brand-deep">Estimasi penyiapan ±{wait + mins} menit</p>
                     )}
                     <p className="text-[11px] text-slate-500 mt-0.5">
                       {readyAt
-                        ? `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`
-                        : 'Dihitung sejak pembayaran Anda diverifikasi kasir.'}
+                        ? (ahead > 0
+                            ? `${ahead} pesanan lebih dulu di depan Anda, penyiapan pesanan Anda ±${mins} menit.`
+                            : `Total waktu penyiapan ±${mins} menit. Bisa bergeser saat cafe sedang ramai.`)
+                        : (wait > 0
+                            ? `Antrean ±${wait} menit + penyiapan ±${mins} menit, dihitung sejak pembayaran diverifikasi.`
+                            : 'Dihitung sejak pembayaran Anda diverifikasi kasir.')}
                     </p>
                   </div>
                 </div>

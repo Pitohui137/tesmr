@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS settings (
   phone TEXT NOT NULL DEFAULT '',
   qris_merchant_name TEXT NOT NULL DEFAULT '',
   qris_code_text TEXT NOT NULL DEFAULT '',
-  qris_image_url TEXT NOT NULL DEFAULT ''
+  qris_image_url TEXT NOT NULL DEFAULT '',
+  best_seller_auto INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS users (
