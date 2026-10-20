@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MenuItem, Order, PaymentMethod, CafeSettings, OrderItem, MAX_TABLES } from '../types';
-import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload, Clock } from 'lucide-react';
+import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, RefreshCw, X, ArrowLeft, ArrowRight, CreditCard, Plus, Sunrise, Sun, Sunset, Moon, MoonStar, Utensils, Coffee, Cookie, Cake, Flame, Upload, Clock, Gift } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 import { compressImage } from '../utils/image';
 import { estimateMinutes, formatClock } from '../utils/estimate';
 import { stockMessage } from '../utils/stock';
+import { LoyaltyStatus, computeDiscount, normalizePhone } from '../utils/loyalty';
 
 const isBestSellerItem = (m: { isBestSeller?: boolean; isAutoBestSeller?: boolean }) => !!(m.isBestSeller || m.isAutoBestSeller);
 const isStockOut = (m: { stockRemaining?: number | null }) => m.stockRemaining != null && m.stockRemaining <= 0;
@@ -51,6 +52,8 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   // Get table from URL or state
   const [tableNumber, setTableNumber] = useState<string>('');
   const [customerName, setCustomerName] = useState<string>(() => localStorage.getItem('customer_name') || '');
+  const [customerPhone, setCustomerPhone] = useState<string>(() => localStorage.getItem('customer_phone') || '');
+  const [loyalty, setLoyalty] = useState<LoyaltyStatus | null>(null);
   const [isNameSubmitted, setIsNameSubmitted] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [activeCategory, setActiveCategory] = useState<string>('semua');
@@ -174,6 +177,22 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
     }
   }, []);
 
+  // Status voucher berdasarkan nomor HP (diperbarui saat nomor berubah / status pesanan berubah)
+  useEffect(() => {
+    const phone = normalizePhone(customerPhone);
+    if (!phone) { setLoyalty(null); return; }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const r = await fetch(`/api/loyalty/${phone}`);
+        if (!r.ok) return;
+        const d: LoyaltyStatus = await r.json();
+        if (!cancelled) setLoyalty(d);
+      } catch {}
+    }, 400);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [customerPhone, placedOrder?.id, orderStatusPoll?.status]);
+
   // Real-time SSE + polling for order status
   useEffect(() => {
     const orderId = placedOrder?.id;
@@ -220,11 +239,18 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
       setError('Silakan masukkan nama Anda!');
       return;
     }
+    const phone = normalizePhone(customerPhone);
+    if (!phone) {
+      setError('Masukkan nomor HP yang valid, contoh: 081234567890');
+      return;
+    }
     if (!tableNumber) {
       setError('Silakan pilih nomor meja Anda!');
       return;
     }
     localStorage.setItem('customer_name', customerName.trim());
+    localStorage.setItem('customer_phone', phone);
+    setCustomerPhone(phone);
     setIsNameSubmitted(true);
     setError('');
   };
@@ -247,6 +273,13 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
       return sum + itemPriceOf(key) * (qty as number);
     }, 0);
   };
+
+  // Diskon voucher yang akan otomatis terpasang (pratinjau; hitungan final ada di server)
+  const getVoucherDiscount = () =>
+    loyalty?.enabled && loyalty.voucher
+      ? computeDiscount(getCartTotal(), loyalty.voucher.percent, loyalty.voucher.maxDiscount)
+      : 0;
+  const getPayableTotal = () => getCartTotal() - getVoucherDiscount();
 
   const getCartEstimate = () =>
     estimateMinutes(
@@ -373,6 +406,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           customerName: customerName.trim(),
+          customerPhone: normalizePhone(customerPhone),
           tableNumber,
           items: orderItems,
           paymentMethod
@@ -525,6 +559,37 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                 className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-brand-forest bg-gray-50 focus:bg-white transition-all text-gray-800 font-medium"
               />
               <p className="text-xs text-gray-400">Nama ini akan tercetak di struk belanja Anda.</p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-semibold text-gray-700">Nomor HP</label>
+              <input
+                type="tel"
+                inputMode="numeric"
+                autoComplete="tel"
+                value={customerPhone}
+                onChange={(e) => setCustomerPhone(e.target.value)}
+                placeholder="Contoh: 081234567890"
+                className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-brand-forest bg-gray-50 focus:bg-white transition-all text-gray-800 font-medium"
+              />
+              {loyalty?.enabled && loyalty.voucher ? (
+                <div className="flex items-start gap-2 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs">
+                  <Gift size={16} className="flex-shrink-0 mt-0.5" />
+                  <span>
+                    <span className="font-bold">Kamu punya voucher diskon {loyalty.voucher.percent}%</span>
+                    {loyalty.voucher.maxDiscount > 0 ? ` (maks. ${formatPrice(loyalty.voucher.maxDiscount)})` : ''}. Otomatis terpasang di pesanan ini.
+                  </span>
+                </div>
+              ) : loyalty?.enabled ? (
+                <p className="text-xs text-emerald-700 font-medium">
+                  <Gift size={12} className="inline -mt-0.5 mr-1" />
+                  {loyalty.completedOrders > 0
+                    ? `Pesanan selesai: ${loyalty.completedOrders}. ${loyalty.remaining} pesanan lagi untuk dapat voucher diskon.`
+                    : `Dapatkan voucher diskon setiap ${loyalty.every} pesanan selesai.`}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-400">Nomor HP dipakai untuk voucher diskon & riwayat pesanan.</p>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -815,7 +880,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                   </div>
                   <div className="text-left">
                     <span className="block text-[10px] text-brand-light-sage uppercase font-extrabold tracking-wider">Keranjang Pesanan</span>
-                    <span className="text-base font-bold text-white">{formatPrice(getCartTotal())}</span>
+                    <span className="text-base font-bold text-white">{formatPrice(getPayableTotal())}</span>
                   </div>
                 </div>
                 <div className="flex items-center gap-1 font-bold text-sm text-brand-light-sage">
@@ -962,9 +1027,21 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
 
                 {/* Drawer Footer (Total and CTA) */}
                 <div className="p-5 border-t border-slate-100 bg-slate-50">
+                  {getVoucherDiscount() > 0 && (
+                    <div className="mb-3 space-y-1 text-sm">
+                      <div className="flex justify-between text-slate-500">
+                        <span>Subtotal</span>
+                        <span>{formatPrice(getCartTotal())}</span>
+                      </div>
+                      <div className="flex justify-between text-emerald-700 font-semibold">
+                        <span className="flex items-center gap-1"><Gift size={14} /> Voucher diskon {loyalty?.voucher?.percent}%</span>
+                        <span>-{formatPrice(getVoucherDiscount())}</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="flex justify-between items-center mb-4">
                     <span className="text-slate-500 font-semibold text-sm">Total Pembayaran</span>
-                    <span className="text-xl font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                    <span className="text-xl font-black text-brand-deep">{formatPrice(getPayableTotal())}</span>
                   </div>
                   {cartEstimateRow('-mt-2 mb-4')}
 
@@ -1042,9 +1119,21 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     })}
                   </div>
                   <hr className="border-slate-100" />
+                  {getVoucherDiscount() > 0 && (
+                    <div className="space-y-1 text-sm">
+                      <div className="flex justify-between text-slate-500">
+                        <span>Subtotal</span>
+                        <span>{formatPrice(getCartTotal())}</span>
+                      </div>
+                      <div className="flex justify-between text-emerald-700 font-semibold">
+                        <span className="flex items-center gap-1"><Gift size={14} /> Voucher diskon {loyalty?.voucher?.percent}%</span>
+                        <span>-{formatPrice(getVoucherDiscount())}</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500 font-bold text-sm">Total Pembayaran</span>
-                    <span className="text-lg font-black text-brand-deep">{formatPrice(getCartTotal())}</span>
+                    <span className="text-lg font-black text-brand-deep">{formatPrice(getPayableTotal())}</span>
                   </div>
                   {cartEstimateRow('')}
                 </div>
@@ -1370,6 +1459,19 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
 
           <hr className="border-slate-100" />
 
+          {(currentOrder.discountAmount || 0) > 0 && (
+            <div className="space-y-1 text-xs">
+              <div className="flex justify-between text-slate-500">
+                <span>Subtotal</span>
+                <span>{formatPrice(currentOrder.totalPrice + (currentOrder.discountAmount || 0))}</span>
+              </div>
+              <div className="flex justify-between text-emerald-700 font-semibold">
+                <span className="flex items-center gap-1"><Gift size={12} /> Voucher diskon {currentOrder.voucherPercent}%</span>
+                <span>-{formatPrice(currentOrder.discountAmount || 0)}</span>
+              </div>
+            </div>
+          )}
+
           <div className="flex justify-between items-center">
             <span className="text-slate-500 text-xs font-bold uppercase tracking-wider">Total Pembayaran</span>
             <span className="text-base font-black text-brand-deep">{formatPrice(currentOrder.totalPrice)}</span>
@@ -1397,6 +1499,15 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
         {/* Back to Order Option if Done */}
         {currentOrder.status === 'selesai' && (
           <div className="p-4 bg-brand-badge-bg/40 border-t border-brand-badge-border text-center">
+            {loyalty?.enabled && loyalty.voucher && (
+              <div className="mb-3 flex items-start gap-2 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs text-left">
+                <Gift size={16} className="flex-shrink-0 mt-0.5" />
+                <span>
+                  <span className="font-bold">Selamat! Voucher diskon {loyalty.voucher.percent}% untuk pesanan berikutnya.</span>{' '}
+                  Otomatis terpasang saat Anda memesan lagi dengan nomor HP yang sama.
+                </span>
+              </div>
+            )}
             <button
               onClick={() => {
                 setPlacedOrder(null);

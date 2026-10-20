@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { CafeSettings, MenuItem, Order, UserAccount, OrderItem, AppLog } from './src/types';
+import { LOYALTY_DEFAULTS, LoyaltyStatus, Voucher, computeOrderTotals, loyaltyProgress, maskPhone, normalizePhone, sanitizeLoyaltyConfig } from './src/utils/loyalty';
 import { MENUS } from './server/menu-data';
 import { computeQueue, getOrderEta } from './src/utils/estimate';
 import { computeAutoBestSellers } from './src/utils/bestseller';
@@ -461,6 +462,7 @@ interface DBState {
   orders: Order[];
   appLogs?: AppLog[];
   proofs?: Record<string, { image: string; createdAt: string }>;
+  vouchers?: Voucher[];
 }
 
 let dbState: DBState = {
@@ -522,6 +524,8 @@ function loadDB() {
         additionalAmount: o.additionalAmount || 0
       }));
       if (!dbState.appLogs) dbState.appLogs = [];
+      if (!dbState.vouchers) dbState.vouchers = [];
+      dbState.settings = { ...dbState.settings, ...sanitizeLoyaltyConfig(dbState.settings as any) };
       saveDB();
     } else {
       saveDB();
@@ -600,6 +604,9 @@ if (fs.existsSync(LEGACY_DB)) {
 }
 
 loadDB();
+// Pastikan aturan voucher selalu ada di pengaturan (juga pada database baru)
+dbState.settings = { ...dbState.settings, ...sanitizeLoyaltyConfig(dbState.settings as any) };
+if (!dbState.vouchers) dbState.vouchers = [];
 
 interface JwtPayload {
   userId: string;
@@ -730,7 +737,8 @@ app.post('/api/settings', authMiddleware, requireRole('owner', 'admin'), (req, r
 
   dbState.settings = {
     name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl,
-    bestSellerAuto: bestSellerAuto !== undefined ? !!bestSellerAuto : !!dbState.settings.bestSellerAuto
+    bestSellerAuto: bestSellerAuto !== undefined ? !!bestSellerAuto : !!dbState.settings.bestSellerAuto,
+    ...sanitizeLoyaltyConfig(req.body, sanitizeLoyaltyConfig(dbState.settings as any))
   };
   bestSellerCache = null;
   saveDB();
@@ -1006,6 +1014,100 @@ app.get('/api/logs', authMiddleware, requireRole('admin'), (req, res) => {
   res.json(logs);
 });
 
+// ====== Voucher loyalitas (berdasarkan nomor HP) ======
+const loyaltyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  message: { error: 'Terlalu banyak permintaan. Coba lagi sebentar.' }
+});
+
+function getLoyaltyConfig() {
+  return sanitizeLoyaltyConfig(dbState.settings as any, LOYALTY_DEFAULTS);
+}
+
+function getVouchers(): Voucher[] {
+  if (!dbState.vouchers) dbState.vouchers = [];
+  return dbState.vouchers;
+}
+
+function completedOrdersOf(phone: string): number {
+  return dbState.orders.filter(o => o.customerPhone === phone && o.status === 'selesai').length;
+}
+
+// Voucher aktif tertua milik nomor HP ini
+function findActiveVoucher(phone: string): Voucher | undefined {
+  return getVouchers()
+    .filter(v => v.phone === phone && v.status === 'aktif')
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+}
+
+// Dipanggil setelah pesanan berstatus 'selesai': tiap kelipatan N pesanan selesai -> 1 voucher baru
+function issueVoucherIfEarned(order: Order) {
+  const cfg = getLoyaltyConfig();
+  if (!cfg.loyaltyEnabled || !order.customerPhone) return;
+  const vouchers = getVouchers();
+  if (vouchers.some(v => v.sourceOrderId === order.id)) return; // idempoten
+  const done = completedOrdersOf(order.customerPhone);
+  if (done > 0 && done % cfg.loyaltyEvery === 0) {
+    vouchers.push({
+      id: `VCH-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
+      phone: order.customerPhone,
+      percent: cfg.loyaltyPercent,
+      maxDiscount: cfg.loyaltyMaxDiscount,
+      status: 'aktif',
+      sourceOrderId: order.id,
+      createdAt: new Date().toISOString(),
+    });
+    logApp('INFO', `Voucher baru untuk ${maskPhone(order.customerPhone)} (pesanan ${order.id})`, { orderId: order.id, percent: cfg.loyaltyPercent });
+  }
+}
+
+// Pesanan dibatalkan/dihapus -> voucher yang dipakainya kembali aktif
+function restoreVoucher(order: Order) {
+  if (!order.voucherId) return;
+  const v = getVouchers().find(x => x.id === order.voucherId);
+  if (v && v.status === 'terpakai' && v.usedOrderId === order.id) {
+    v.status = 'aktif';
+    delete v.usedOrderId;
+    delete v.usedAt;
+  }
+}
+
+// Hitung ulang total (setelah diskon) dari item pesanan
+function applyTotals(order: Order) {
+  const t = computeOrderTotals(order.items, order.voucherPercent || 0, order.voucherMax || 0);
+  order.totalPrice = t.total;
+  order.discountAmount = t.discount;
+}
+
+// Versi publik pesanan: nomor HP disamarkan
+function publicOrder(order: Order) {
+  return { ...order, customerPhone: order.customerPhone ? maskPhone(order.customerPhone) : undefined };
+}
+
+// Publik: status loyalitas & voucher untuk satu nomor HP
+app.get('/api/loyalty/:phone', loyaltyLimiter, (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  if (!phone) return res.status(400).json({ error: 'Nomor HP tidak valid' });
+  const cfg = getLoyaltyConfig();
+  const completed = completedOrdersOf(phone);
+  const v = cfg.loyaltyEnabled ? findActiveVoucher(phone) : undefined;
+  const status: LoyaltyStatus = {
+    enabled: cfg.loyaltyEnabled,
+    phone,
+    completedOrders: completed,
+    every: cfg.loyaltyEvery,
+    remaining: loyaltyProgress(completed, cfg.loyaltyEvery).remaining,
+    voucher: v ? { percent: v.percent, maxDiscount: v.maxDiscount } : null,
+  };
+  res.json(status);
+});
+
+// Staf: daftar voucher (untuk dashboard)
+app.get('/api/vouchers', authMiddleware, requireRole('owner', 'kasir', 'admin'), (req, res) => {
+  res.json(getVouchers().slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 200));
+});
+
 let clients: any[] = [];
 app.get('/api/orders/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1020,7 +1122,8 @@ app.get('/api/orders/events', (req, res) => {
 });
 
 function notifyClientsOfNewOrder(order: Order) {
-  const payload = JSON.stringify({ type: 'NEW_ORDER', order });
+  // Stream ini publik: samarkan nomor HP
+  const payload = JSON.stringify({ type: 'NEW_ORDER', order: publicOrder(order) });
   clients.forEach(c => c.write(`data: ${payload}\n\n`));
 }
 
@@ -1038,6 +1141,10 @@ app.post('/api/orders', (req, res) => {
   const { customerName, tableNumber, items, paymentMethod } = req.body;
   if (!customerName || !tableNumber || !items || !items.length || !paymentMethod) {
     return res.status(400).json({ error: "Semua data pesanan wajib diisi (Nama, Meja, Item, Metode Pembayaran)" });
+  }
+  const customerPhone = normalizePhone(req.body.customerPhone);
+  if (!customerPhone) {
+    return res.status(400).json({ error: "Nomor HP wajib diisi dengan benar (contoh: 081234567890)" });
   }
 
   let id = `ORD-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -1063,23 +1170,38 @@ app.post('/api/orders', (req, res) => {
     return res.status(409).json({ error: stockMessage(short.name, short.remaining) });
   }
 
+  // Voucher otomatis terpasang bila nomor HP ini punya voucher aktif
+  const cfg = getLoyaltyConfig();
+  const voucher = cfg.loyaltyEnabled ? findActiveVoucher(customerPhone) : undefined;
+  const totals = computeOrderTotals(orderItems, voucher?.percent || 0, voucher?.maxDiscount || 0);
+
   const newOrder: Order = {
     id,
     customerName,
+    customerPhone,
     tableNumber,
     items: orderItems,
-    totalPrice: orderItems.reduce((sum, item) => sum + (item.price * item.quantity), 0),
+    totalPrice: totals.total,
     paymentMethod,
     status: 'menunggu_verifikasi',
     additionalAmount: 0,
     createdAt: new Date().toISOString()
   };
+  if (voucher && totals.discount > 0) {
+    newOrder.discountAmount = totals.discount;
+    newOrder.voucherId = voucher.id;
+    newOrder.voucherPercent = voucher.percent;
+    newOrder.voucherMax = voucher.maxDiscount;
+    voucher.status = 'terpakai';
+    voucher.usedOrderId = id;
+    voucher.usedAt = new Date().toISOString();
+  }
 
   dbState.orders.push(newOrder);
   saveDB();
   trackOrder();
   notifyClientsOfNewOrder(newOrder);
-  logApp('INFO', `Pesanan baru dibuat: ${id} (${customerName}, meja ${tableNumber})`, { orderId: id, table: tableNumber, total: newOrder.totalPrice, payment: paymentMethod });
+  logApp('INFO', `Pesanan baru dibuat: ${id} (${customerName}, meja ${tableNumber})`, { orderId: id, table: tableNumber, total: newOrder.totalPrice, payment: paymentMethod, discount: newOrder.discountAmount || 0 });
   res.status(201).json({ message: "Pesanan berhasil dibuat!", order: newOrder });
 });
 
@@ -1095,9 +1217,9 @@ app.get('/api/orders/:id', (req, res) => {
   }
   if (order.status === 'diproses' || order.status === 'menunggu_verifikasi') {
     const queue = computeQueue(dbState.orders, dbState.menu);
-    return res.json({ ...order, eta: getOrderEta(order, queue, dbState.menu) });
+    return res.json({ ...publicOrder(order), eta: getOrderEta(order, queue, dbState.menu) });
   }
-  res.json(order);
+  res.json(publicOrder(order));
 });
 
 // Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
@@ -1158,11 +1280,13 @@ app.put('/api/orders/:id/status', authMiddleware, requireRole('owner', 'kasir'),
   }
 
   dbState.orders[orderIndex].status = status;
+  if (status === 'dibatalkan') restoreVoucher(dbState.orders[orderIndex]);
   if (status === 'diproses') {
     dbState.orders[orderIndex].processedAt = new Date().toISOString();
   }
   if (status === 'selesai') {
     dbState.orders[orderIndex].additionalAmount = 0;
+    issueVoucherIfEarned(dbState.orders[orderIndex]);
   }
   saveDB();
   notifyClientsOfStatusChange(id, status);
@@ -1195,9 +1319,7 @@ app.put('/api/orders/:id/items/:menuId/cancel', authMiddleware, requireRole('own
     cancelledAt: new Date().toISOString()
   };
 
-  order.totalPrice = order.items
-    .filter(i => !i.isCancelled)
-    .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  applyTotals(order);
 
   order.additionalAmount = order.items
     .filter(i => i.isAdditional && !i.isCancelled)
@@ -1244,9 +1366,7 @@ app.put('/api/orders/:id/items/:menuId/uncancel', authMiddleware, requireRole('o
     cancelledAt: undefined
   };
 
-  order.totalPrice = order.items
-    .filter(i => !i.isCancelled)
-    .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  applyTotals(order);
 
   order.additionalAmount = order.items
     .filter(i => i.isAdditional && !i.isCancelled)
@@ -1271,6 +1391,7 @@ app.put('/api/orders/:id/cancel', authMiddleware, requireRole('owner', 'kasir'),
   const order = dbState.orders[orderIndex];
   order.status = 'dibatalkan';
   order.items = order.items.map(i => ({ ...i, isCancelled: true, cancelledAt: new Date().toISOString() }));
+  restoreVoucher(order);
 
   dbState.orders[orderIndex] = order;
   saveDB();
@@ -1290,6 +1411,7 @@ app.delete('/api/orders/:id', authMiddleware, requireRole('owner', 'kasir'), (re
     return res.status(400).json({ error: "Pesanan sudah diarsipkan" });
   }
 
+  restoreVoucher(dbState.orders[orderIndex]);
   const deleted = dbState.orders.splice(orderIndex, 1);
   if (dbState.proofs) delete dbState.proofs[id];
   saveDB();
@@ -1316,9 +1438,7 @@ app.delete('/api/orders/:id/items/:menuId', authMiddleware, requireRole('owner',
 
   order.items.splice(itemIndex, 1);
 
-  order.totalPrice = order.items
-    .filter(i => !i.isCancelled)
-    .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  applyTotals(order);
 
   order.additionalAmount = order.items
     .filter(i => i.isAdditional && !i.isCancelled)
@@ -1413,9 +1533,7 @@ app.post('/api/orders/:id/items', (req, res) => {
 
   order.items.push(...itemsToAdd);
 
-  order.totalPrice = order.items
-    .filter(i => !i.isCancelled)
-    .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  applyTotals(order);
 
   order.additionalAmount = order.items
     .filter(i => i.isAdditional && !i.isCancelled)

@@ -9,6 +9,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
 import { compressImage } from '../utils/image';
+import { LOYALTY_DEFAULTS } from '../utils/loyalty';
 
 function Row({ k, v, key }: { k: string; v: any; key?: React.Key }) {
   return (
@@ -45,6 +46,10 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
   const [qrisText, setQrisText] = useState<string>(settings.qrisCodeText);
   const [qrisImageUrl, setQrisImageUrl] = useState<string>(settings.qrisImageUrl || '');
   const [bestSellerAuto, setBestSellerAuto] = useState<boolean>(!!settings.bestSellerAuto);
+  const [loyaltyEnabled, setLoyaltyEnabled] = useState<boolean>(settings.loyaltyEnabled ?? LOYALTY_DEFAULTS.loyaltyEnabled);
+  const [loyaltyEvery, setLoyaltyEvery] = useState<string>(String(settings.loyaltyEvery ?? LOYALTY_DEFAULTS.loyaltyEvery));
+  const [loyaltyPercent, setLoyaltyPercent] = useState<string>(String(settings.loyaltyPercent ?? LOYALTY_DEFAULTS.loyaltyPercent));
+  const [loyaltyMaxDiscount, setLoyaltyMaxDiscount] = useState<string>(String(settings.loyaltyMaxDiscount ?? LOYALTY_DEFAULTS.loyaltyMaxDiscount));
 
   // Modal / Form states for MENU CRUD
   const [isMenuModalOpen, setIsMenuModalOpen] = useState<boolean>(false);
@@ -467,7 +472,11 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
           qrisMerchantName: qrisMerchant.trim(),
           qrisCodeText: qrisText.trim(),
           qrisImageUrl: qrisImageUrl.trim(),
-          bestSellerAuto
+          bestSellerAuto,
+          loyaltyEnabled,
+          loyaltyEvery: Number(loyaltyEvery),
+          loyaltyPercent: Number(loyaltyPercent),
+          loyaltyMaxDiscount: Number(loyaltyMaxDiscount) || 0
         })
       });
 
@@ -788,11 +797,11 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
               <button
                 onClick={() => {
                   const rows = reportData?.orders || [];
-                  const csvHeader = 'ID Pesanan,Pelanggan,Meja,Items,Total,Metode,Status,Tanggal';
+                  const csvHeader = 'ID Pesanan,Pelanggan,No. HP,Meja,Items,Diskon Voucher,Total,Metode,Status,Tanggal';
                   const esc = (v: any) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
                   const csvRows = rows.map(o => {
                     const items = o.items.map(it => `${it.name} x${it.quantity}`).join('; ');
-                    return [o.id, o.customerName, o.tableNumber, items, o.totalPrice, o.paymentMethod, o.status, new Date(o.createdAt).toLocaleString('id-ID')].map(esc).join(',');
+                    return [o.id, o.customerName, o.customerPhone || '', o.tableNumber, items, o.discountAmount || 0, o.totalPrice, o.paymentMethod, o.status, new Date(o.createdAt).toLocaleString('id-ID')].map(esc).join(',');
                   });
                   const csv = '\uFEFF' + [csvHeader, ...csvRows].join('\n');
                   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -1309,6 +1318,55 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                 </div>
                 <p className="text-[10px] text-slate-400 font-normal leading-normal">
                   Menu terlaris per kategori (maks. 2 per kategori, minimal 5 terjual dalam 30 hari terakhir) otomatis mendapat badge Best Seller. Menu yang Anda tandai manual tetap menjadi Best Seller.
+                </p>
+              </div>
+
+              <div className="space-y-3 border-t border-slate-100 pt-5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="loyaltyEnabled"
+                    checked={loyaltyEnabled}
+                    onChange={(e) => setLoyaltyEnabled(e.target.checked)}
+                    className="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500"
+                  />
+                  <label htmlFor="loyaltyEnabled" className="text-slate-700 font-bold select-none cursor-pointer">
+                    Voucher diskon pelanggan (berdasarkan nomor HP)
+                  </label>
+                </div>
+                {loyaltyEnabled && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="space-y-1">
+                      <label className="block text-xs font-bold text-slate-600">Voucher tiap … pesanan selesai</label>
+                      <input
+                        type="number" min={1} max={100}
+                        value={loyaltyEvery}
+                        onChange={(e) => setLoyaltyEvery(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-slate-50 focus:bg-white font-medium"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-xs font-bold text-slate-600">Besar diskon (%)</label>
+                      <input
+                        type="number" min={1} max={100}
+                        value={loyaltyPercent}
+                        onChange={(e) => setLoyaltyPercent(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-slate-50 focus:bg-white font-medium"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-xs font-bold text-slate-600">Maks. potongan (Rp, 0 = tanpa batas)</label>
+                      <input
+                        type="number" min={0} step={1000}
+                        value={loyaltyMaxDiscount}
+                        onChange={(e) => setLoyaltyMaxDiscount(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-slate-50 focus:bg-white font-medium"
+                      />
+                    </div>
+                  </div>
+                )}
+                <p className="text-[10px] text-slate-400 font-normal leading-normal">
+                  Pelanggan wajib mengisi nomor HP saat memesan. Setiap kelipatan pesanan selesai dengan nomor yang sama menghasilkan 1 voucher, yang otomatis terpasang di pesanan berikutnya. Diskon hanya untuk item pesanan awal (item tambahan tetap harga penuh). Voucher otomatis aktif kembali bila pesanan yang memakainya dibatalkan. Perubahan aturan hanya berlaku untuk voucher yang terbit setelahnya.
                 </p>
               </div>
 

@@ -4,12 +4,13 @@ import { SignJWT, jwtVerify } from 'jose';
 import { computeQueue, getOrderEta } from '../src/utils/estimate';
 import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
 import { computeStockUsed, dayStartMs, findStockShortage, parseDailyStock, stockMessage } from '../src/utils/stock';
+import { LOYALTY_DEFAULTS, computeOrderTotals, loyaltyProgress, maskPhone, normalizePhone, sanitizeLoyaltyConfig } from '../src/utils/loyalty';
 
 // ====== Minimal D1 / Workers types ======
 interface D1PreparedStatement {
   bind(...values: any[]): D1PreparedStatement;
   first<T = unknown>(): Promise<T | null>;
-  run(): Promise<{ success: boolean }>;
+  run(): Promise<{ success: boolean; meta?: { changes?: number } }>;
   all<T = unknown>(): Promise<{ results: T[]; success: boolean }>;
 }
 interface D1Database {
@@ -53,6 +54,10 @@ interface SettingsRow {
   qris_code_text: string;
   qris_image_url: string;
   best_seller_auto?: number;
+  loyalty_enabled?: number;
+  loyalty_every?: number;
+  loyalty_percent?: number;
+  loyalty_max_discount?: number;
 }
 
 interface MenuRow {
@@ -82,6 +87,23 @@ interface OrderRow {
   has_payment_proof?: number;
   processed_at?: string | null;
   created_at: string;
+  customer_phone?: string;
+  discount_amount?: number;
+  voucher_id?: string | null;
+  voucher_percent?: number;
+  voucher_max?: number;
+}
+
+interface VoucherRow {
+  id: string;
+  phone: string;
+  percent: number;
+  max_discount: number;
+  status: string;
+  source_order_id: string;
+  used_order_id?: string | null;
+  created_at: string;
+  used_at?: string | null;
 }
 
 type Variables = {
@@ -182,6 +204,24 @@ const apiLimiter = async (c: any, next: any) => {
   await next();
 };
 
+// Cek voucher per nomor HP bersifat publik (GET), jadi dibatasi agar nomor tidak bisa ditebak massal
+const loyaltyLimiter = async (c: any, next: any) => {
+  const ip = c.req.header('CF-Connecting-IP') || 'local';
+  const now = Date.now();
+  const key = `loyalty:${ip}`;
+  const rec = rateStore.get(key);
+  if (!rec || rec.resetAt < now) {
+    rateStore.set(key, { count: 1, resetAt: now + 60 * 1000 });
+    await next();
+    return;
+  }
+  if (rec.count >= 40) {
+    return c.json({ error: 'Terlalu banyak permintaan. Coba lagi sebentar.' }, 429);
+  }
+  rec.count += 1;
+  await next();
+};
+
 const auth = async (c: any, next: any) => {
   const token = getCookie(c, 'token');
   if (!token) return c.json({ error: 'Silakan login terlebih dahulu' }, 401);
@@ -236,7 +276,18 @@ function toOrder(o: OrderRow) {
     archivedAt: o.archived_at || undefined,
     hasPaymentProof: !!o.has_payment_proof,
     processedAt: o.processed_at || undefined,
+    customerPhone: o.customer_phone || undefined,
+    discountAmount: o.discount_amount || 0,
+    voucherId: o.voucher_id || undefined,
+    voucherPercent: o.voucher_percent || 0,
+    voucherMax: o.voucher_max || 0,
   };
+}
+
+// Versi publik pesanan: nomor HP disamarkan
+function toPublicOrder(o: OrderRow) {
+  const order = toOrder(o);
+  return { ...order, customerPhone: order.customerPhone ? maskPhone(order.customerPhone) : undefined };
 }
 
 function computeAdditionalAmount(items: any[]): number {
@@ -347,8 +398,14 @@ async function getSettingsCached(db: D1Database): Promise<any> {
         name: row.name, address: row.address, phone: row.phone,
         qrisMerchantName: row.qris_merchant_name, qrisCodeText: row.qris_code_text, qrisImageUrl: row.qris_image_url,
         bestSellerAuto: !!row.best_seller_auto,
+        ...sanitizeLoyaltyConfig({
+          loyaltyEnabled: row.loyalty_enabled === undefined || row.loyalty_enabled === null ? true : !!row.loyalty_enabled,
+          loyaltyEvery: row.loyalty_every ?? undefined,
+          loyaltyPercent: row.loyalty_percent ?? undefined,
+          loyaltyMaxDiscount: row.loyalty_max_discount ?? undefined,
+        }),
       }
-    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '', bestSellerAuto: false };
+    : { name: 'Mepet-Rumah', address: '', phone: '', qrisMerchantName: '', qrisCodeText: '', qrisImageUrl: '', bestSellerAuto: false, ...LOYALTY_DEFAULTS };
   settingsCache.ts = Date.now();
   return settingsCache.data;
 }
@@ -542,6 +599,78 @@ app.onError(async (err, c) => {
   return c.json({ error: 'Terjadi kesalahan internal server' }, 500);
 });
 
+// ====== Voucher loyalitas (berdasarkan nomor HP) ======
+async function completedOrdersOf(db: D1Database, phone: string): Promise<number> {
+  const r = await db.prepare("SELECT COUNT(*) AS n FROM orders WHERE customer_phone = ? AND status = 'selesai'").bind(phone).first<{ n: number }>();
+  return r?.n || 0;
+}
+
+// Voucher aktif tertua milik nomor HP ini
+async function findActiveVoucher(db: D1Database, phone: string): Promise<VoucherRow | null> {
+  return db.prepare("SELECT * FROM vouchers WHERE phone = ? AND status = 'aktif' ORDER BY created_at LIMIT 1").bind(phone).first<VoucherRow>();
+}
+
+// Klaim voucher secara atomik (status 'aktif' -> 'terpakai'). false bila keduluan pesanan lain.
+async function claimVoucher(db: D1Database, voucherId: string, orderId: string): Promise<boolean> {
+  const r = await db.prepare("UPDATE vouchers SET status = 'terpakai', used_order_id = ?, used_at = ? WHERE id = ? AND status = 'aktif'")
+    .bind(orderId, new Date().toISOString(), voucherId).run();
+  return (r.meta?.changes ?? 0) > 0;
+}
+
+// Pesanan dibatalkan/dihapus -> voucher yang dipakainya kembali aktif
+async function restoreVoucher(db: D1Database, order: OrderRow) {
+  if (!order.voucher_id) return;
+  await db.prepare("UPDATE vouchers SET status = 'aktif', used_order_id = NULL, used_at = NULL WHERE id = ? AND used_order_id = ?")
+    .bind(order.voucher_id, order.id).run();
+}
+
+// Dipanggil setelah pesanan berstatus 'selesai': tiap kelipatan N pesanan selesai -> 1 voucher baru
+async function issueVoucherIfEarned(c: any, order: OrderRow) {
+  const phone = order.customer_phone;
+  if (!phone) return;
+  const cfg = sanitizeLoyaltyConfig(await getSettingsCached(c.env.DB));
+  if (!cfg.loyaltyEnabled) return;
+  const done = await completedOrdersOf(c.env.DB, phone);
+  if (done <= 0 || done % cfg.loyaltyEvery !== 0) return;
+  const id = `VCH-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+  // source_order_id UNIQUE + OR IGNORE => idempoten (tidak ganda walau dipanggil ulang)
+  const r = await c.env.DB.prepare(
+    "INSERT OR IGNORE INTO vouchers (id, phone, percent, max_discount, status, source_order_id, created_at) VALUES (?, ?, ?, ?, 'aktif', ?, ?)"
+  ).bind(id, phone, cfg.loyaltyPercent, cfg.loyaltyMaxDiscount, order.id, new Date().toISOString()).run();
+  if ((r.meta?.changes ?? 0) > 0) {
+    await logApp(c, 'INFO', `Voucher baru untuk ${maskPhone(phone)} (pesanan ${order.id})`, { orderId: order.id, percent: cfg.loyaltyPercent });
+  }
+}
+
+// Publik: status loyalitas & voucher untuk satu nomor HP
+app.get('/api/loyalty/:phone', loyaltyLimiter, async (c) => {
+  const phone = normalizePhone(c.req.param('phone'));
+  if (!phone) return c.json({ error: 'Nomor HP tidak valid' }, 400);
+  const cfg = sanitizeLoyaltyConfig(await getSettingsCached(c.env.DB));
+  const [completed, voucher] = await Promise.all([
+    completedOrdersOf(c.env.DB, phone),
+    cfg.loyaltyEnabled ? findActiveVoucher(c.env.DB, phone) : Promise.resolve(null),
+  ]);
+  return c.json({
+    enabled: cfg.loyaltyEnabled,
+    phone,
+    completedOrders: completed,
+    every: cfg.loyaltyEvery,
+    remaining: loyaltyProgress(completed, cfg.loyaltyEvery).remaining,
+    voucher: voucher ? { percent: voucher.percent, maxDiscount: voucher.max_discount } : null,
+  });
+});
+
+// Staf: daftar voucher (untuk dashboard)
+app.get('/api/vouchers', auth, requireRole('owner', 'kasir', 'admin'), async (c) => {
+  const rows = await c.env.DB.prepare('SELECT * FROM vouchers ORDER BY created_at DESC LIMIT 200').all<VoucherRow>();
+  return c.json(rows.results.map(v => ({
+    id: v.id, phone: v.phone, percent: v.percent, maxDiscount: v.max_discount, status: v.status,
+    sourceOrderId: v.source_order_id, usedOrderId: v.used_order_id || undefined,
+    createdAt: v.created_at, usedAt: v.used_at || undefined,
+  })));
+});
+
 // Auth
 app.post('/api/auth/login', loginLimiter, async (c) => {
   const { username, password } = await c.req.json().catch(() => ({}));
@@ -604,16 +733,20 @@ app.get('/api/settings', async (c) => {
 });
 
 app.post('/api/settings', auth, requireRole('owner', 'admin'), async (c) => {
-  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch(() => ({}));
+  const { name, address, phone, qrisMerchantName, qrisCodeText, qrisImageUrl, bestSellerAuto } = body;
   if (!name || !address || !phone) return c.json({ error: 'Semua data cafe utama harus diisi!' }, 400);
   const current = await getSettingsCached(c.env.DB);
   const autoFlag = bestSellerAuto === undefined ? !!current.bestSellerAuto : !!bestSellerAuto;
+  const loy = sanitizeLoyaltyConfig(body, sanitizeLoyaltyConfig(current));
   await c.env.DB.prepare(
-    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url, best_seller_auto) VALUES (1, ?, ?, ?, ?, ?, ?, ?) ' +
+    'INSERT INTO settings (id, name, address, phone, qris_merchant_name, qris_code_text, qris_image_url, best_seller_auto, loyalty_enabled, loyalty_every, loyalty_percent, loyalty_max_discount) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
     'ON CONFLICT(id) DO UPDATE SET name = excluded.name, address = excluded.address, phone = excluded.phone, ' +
     'qris_merchant_name = excluded.qris_merchant_name, qris_code_text = excluded.qris_code_text, qris_image_url = excluded.qris_image_url, ' +
-    'best_seller_auto = excluded.best_seller_auto'
-  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '', autoFlag ? 1 : 0).run();
+    'best_seller_auto = excluded.best_seller_auto, loyalty_enabled = excluded.loyalty_enabled, loyalty_every = excluded.loyalty_every, ' +
+    'loyalty_percent = excluded.loyalty_percent, loyalty_max_discount = excluded.loyalty_max_discount'
+  ).bind(name, address, phone, qrisMerchantName || '', qrisCodeText || '', qrisImageUrl || '', autoFlag ? 1 : 0,
+    loy.loyaltyEnabled ? 1 : 0, loy.loyaltyEvery, loy.loyaltyPercent, loy.loyaltyMaxDiscount).run();
   invalidateSettingsCache();
   return c.json({ message: 'Pengaturan cafe berhasil diperbarui' });
 });
@@ -795,9 +928,14 @@ app.get('/api/logs', auth, requireRole('admin'), async (c) => {
 });
 
 app.post('/api/orders', async (c) => {
-  const { customerName, tableNumber, items, paymentMethod } = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch(() => ({}));
+  const { customerName, tableNumber, items, paymentMethod } = body;
   if (!customerName || !tableNumber || !items || !items.length || !paymentMethod) {
     return c.json({ error: 'Semua data pesanan wajib diisi (Nama, Meja, Item, Metode Pembayaran)' }, 400);
+  }
+  const customerPhone = normalizePhone(body.customerPhone);
+  if (!customerPhone) {
+    return c.json({ error: 'Nomor HP wajib diisi dengan benar (contoh: 081234567890)' }, 400);
   }
   const menuRows = await getMenuCached(c.env.DB);
   const normItems = items.map((ni: any) => {
@@ -812,7 +950,6 @@ app.post('/api/orders', async (c) => {
     }
     return { menuId: m.id, name, price, quantity: Number(ni.quantity) || 1, notes: ni.notes || '', variant };
   });
-  const totalPrice = normItems.reduce((sum: number, it: any) => sum + (it.price * it.quantity), 0);
 
   // Stok harian: tolak jika melebihi sisa stok
   const stockLimited = normItems.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null);
@@ -821,15 +958,40 @@ app.post('/api/orders', async (c) => {
     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
   }
 
-  const stmt = c.env.DB.prepare(
-    'INSERT INTO orders (id, customer_name, table_number, items, total_price, payment_method, status, additional_amount, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)'
-  );
+  // Voucher otomatis terpasang bila nomor HP ini punya voucher aktif
   let id = generateOrderId();
+  const settings = sanitizeLoyaltyConfig(await getSettingsCached(c.env.DB));
+  let voucher: VoucherRow | null = null;
+  const claimedFor = id; // id pesanan saat voucher diklaim (bisa berganti bila insert harus diulang)
+  if (settings.loyaltyEnabled) {
+    const candidate = await findActiveVoucher(c.env.DB, customerPhone);
+    if (candidate && await claimVoucher(c.env.DB, candidate.id, id)) voucher = candidate;
+  }
+  const totals = computeOrderTotals(normItems, voucher?.percent || 0, voucher?.max_discount || 0);
+  const useVoucher = !!voucher && totals.discount > 0;
+  if (voucher && !useVoucher) {
+    await restoreVoucher(c.env.DB, { id, voucher_id: voucher.id } as OrderRow); // tidak ada potongan -> jangan habiskan voucher
+    voucher = null;
+  }
+
+  const stmt = c.env.DB.prepare(
+    'INSERT INTO orders (id, customer_name, table_number, items, total_price, payment_method, status, additional_amount, created_at, customer_phone, discount_amount, voucher_id, voucher_percent, voucher_max) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)'
+  );
+  const bindOrder = (oid: string) => stmt.bind(
+    oid, customerName, tableNumber, JSON.stringify(normItems), totals.total, paymentMethod, 'menunggu_verifikasi', new Date().toISOString(),
+    customerPhone, useVoucher ? totals.discount : 0, useVoucher ? voucher!.id : null, useVoucher ? voucher!.percent : 0, useVoucher ? voucher!.max_discount : 0
+  );
   try {
-    await stmt.bind(id, customerName, tableNumber, JSON.stringify(normItems), totalPrice, paymentMethod, 'menunggu_verifikasi', new Date().toISOString()).run();
+    await bindOrder(id).run();
   } catch (e) {
     id = generateOrderId();
-    await stmt.bind(id, customerName, tableNumber, JSON.stringify(normItems), totalPrice, paymentMethod, 'menunggu_verifikasi', new Date().toISOString()).run();
+    try {
+      await bindOrder(id).run();
+    } catch (e2) {
+      if (voucher) await restoreVoucher(c.env.DB, { id: claimedFor, voucher_id: voucher.id } as OrderRow);
+      throw e2;
+    }
+    if (useVoucher) await c.env.DB.prepare('UPDATE vouchers SET used_order_id = ? WHERE id = ?').bind(id, voucher!.id).run();
   }
   if (stockLimited) {
     // Cek ulang setelah insert: bila dua pesanan masuk bersamaan dan stok terlampaui, batalkan yang terakhir
@@ -837,6 +999,7 @@ app.post('/api/orders', async (c) => {
     const over = menuRows.find((m: any) => m.dailyStock != null && normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > m.dailyStock);
     if (over) {
       await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
+      if (useVoucher) await restoreVoucher(c.env.DB, { id, voucher_id: voucher!.id } as OrderRow);
       invalidateOrdersCache();
       const own = normItems.filter((i: any) => i.menuId === over.id).reduce((s: number, i: any) => s + i.quantity, 0);
       return c.json({ error: stockMessage(over.name, Math.max(0, over.dailyStock - ((after[over.id] || 0) - own))) }, 409);
@@ -845,7 +1008,7 @@ app.post('/api/orders', async (c) => {
   await trackOrder(c);
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
-  await logApp(c, 'INFO', `Pesanan baru dibuat: ${id} (${customerName}, meja ${tableNumber})`, { orderId: id, table: tableNumber, total: totalPrice, payment: paymentMethod });
+  await logApp(c, 'INFO', `Pesanan baru dibuat: ${id} (${customerName}, meja ${tableNumber})`, { orderId: id, table: tableNumber, total: totals.total, payment: paymentMethod, discount: useVoucher ? totals.discount : 0 });
   return c.json({ message: 'Pesanan berhasil dibuat!', order: toOrder(row!) }, 201);
 });
 
@@ -859,9 +1022,9 @@ app.get('/api/orders/:id', async (c) => {
     const now = Date.now();
     const [menu, all] = await Promise.all([getMenuCached(c.env.DB), getOrdersCached(c.env.DB)]);
     const queue = computeQueue([...all.filter((o: any) => o.id !== id), order], menu, now);
-    return c.json({ ...order, eta: getOrderEta(order, queue, menu, now) });
+    return c.json({ ...toPublicOrder(row), eta: getOrderEta(order, queue, menu, now) });
   }
-  return c.json(order);
+  return c.json(toPublicOrder(row));
 });
 
 // Bukti bayar QRIS: pelanggan mengunggah screenshot (data URL, dikompres di klien).
@@ -911,6 +1074,8 @@ app.put('/api/orders/:id/status', auth, requireRole('owner', 'kasir'), async (c)
   const additionalAmount = status === 'selesai' ? 0 : (order.additional_amount || 0);
   const processedAt = status === 'diproses' ? new Date().toISOString() : (order.processed_at || null);
   await c.env.DB.prepare('UPDATE orders SET status = ?, additional_amount = ?, processed_at = ? WHERE id = ?').bind(status, additionalAmount, processedAt, id).run();
+  if (status === 'dibatalkan') await restoreVoucher(c.env.DB, order);
+  if (status === 'selesai') await issueVoucherIfEarned(c, order);
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   const actor = (c.get('user') as { username?: string })?.username || 'staff';
@@ -925,6 +1090,7 @@ app.put('/api/orders/:id/cancel', auth, requireRole('owner', 'kasir'), async (c)
   if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
   const items = JSON.parse(order.items).map((i: any) => ({ ...i, isCancelled: true, cancelledAt: new Date().toISOString() }));
   await c.env.DB.prepare('UPDATE orders SET status = ?, items = ? WHERE id = ?').bind('dibatalkan', JSON.stringify(items), id).run();
+  await restoreVoucher(c.env.DB, order);
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   await logApp(c, 'WARN', `Pesanan dibatalkan: ${id}`, { orderId: id });
@@ -936,6 +1102,7 @@ app.delete('/api/orders/:id', auth, requireRole('owner', 'kasir'), async (c) => 
   const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
   if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
+  await restoreVoucher(c.env.DB, order);
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM order_proofs WHERE order_id = ?').bind(id),
     c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id),
@@ -955,9 +1122,9 @@ app.put('/api/orders/:id/items/:menuId/cancel', auth, requireRole('owner', 'kasi
   const idx = items.findIndex((i: any) => i.menuId === menuId && (i.variant || '') === (variant || '') && !i.isCancelled);
   if (idx === -1) return c.json({ error: 'Item tidak ditemukan atau sudah dibatalkan' }, 404);
   items[idx] = { ...items[idx], isCancelled: true, cancelledAt: new Date().toISOString() };
-  const total = items.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+  const totals = computeOrderTotals(items, order.voucher_percent || 0, order.voucher_max || 0);
   const additionalAmount = computeAdditionalAmount(items);
-  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), total, additionalAmount, id).run();
+  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, discount_amount = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), totals.total, totals.discount, additionalAmount, id).run();
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   return c.json({ message: 'Item berhasil dibatalkan', order: toOrder(row!) });
@@ -978,9 +1145,9 @@ app.put('/api/orders/:id/items/:menuId/uncancel', auth, requireRole('owner', 'ka
     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
   }
   items[idx] = { ...items[idx], isCancelled: false, cancelledAt: undefined };
-  const total = items.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+  const totals = computeOrderTotals(items, order.voucher_percent || 0, order.voucher_max || 0);
   const additionalAmount = computeAdditionalAmount(items);
-  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), total, additionalAmount, id).run();
+  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, discount_amount = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), totals.total, totals.discount, additionalAmount, id).run();
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   return c.json({ message: 'Item berhasil dipulihkan', order: toOrder(row!) });
@@ -993,9 +1160,9 @@ app.delete('/api/orders/:id/items/:menuId', auth, requireRole('owner', 'kasir'),
   if (!order) return c.json({ error: 'Pesanan tidak ditemukan' }, 404);
   if (order.archived_at) return c.json({ error: 'Pesanan sudah diarsipkan' }, 400);
   const items = JSON.parse(order.items).filter((i: any) => !(i.menuId === menuId && (i.variant || '') === (variant || '')));
-  const total = items.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+  const totals = computeOrderTotals(items, order.voucher_percent || 0, order.voucher_max || 0);
   const additionalAmount = computeAdditionalAmount(items);
-  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), total, additionalAmount, id).run();
+  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, discount_amount = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(items), totals.total, totals.discount, additionalAmount, id).run();
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   return c.json({ message: 'Item berhasil dihapus', order: toOrder(row!) });
@@ -1064,9 +1231,9 @@ app.post('/api/orders/:id/items', async (c) => {
     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
   }
   itemsToAdd.forEach((ni: any) => current.push(ni));
-  const total = current.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+  const totals = computeOrderTotals(current, order.voucher_percent || 0, order.voucher_max || 0);
   const additionalAmount = computeAdditionalAmount(current);
-  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(current), total, additionalAmount, id).run();
+  await c.env.DB.prepare('UPDATE orders SET items = ?, total_price = ?, discount_amount = ?, additional_amount = ? WHERE id = ?').bind(JSON.stringify(current), totals.total, totals.discount, additionalAmount, id).run();
   invalidateOrdersCache();
   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
   await logApp(c, 'INFO', `Item ditambahkan ke ${id} (oleh ${actor})`, { orderId: id, added: itemsToAdd.length, additional: additionalAmount });

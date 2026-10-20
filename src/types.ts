@@ -73,6 +73,12 @@ export interface Order {
   hasPaymentProof?: boolean;
   processedAt?: string;
   eta?: OrderEta;
+  // Nomor HP pelanggan (format 08xx) & voucher diskon yang terpakai di pesanan ini
+  customerPhone?: string;
+  discountAmount?: number;
+  voucherId?: string;
+  voucherPercent?: number;
+  voucherMax?: number;
 }
 
 export interface CafeSettings {
@@ -83,6 +89,11 @@ export interface CafeSettings {
   qrisCodeText: string;
   qrisImageUrl?: string;
   bestSellerAuto?: boolean;
+  // Program voucher loyalitas (berdasarkan nomor HP)
+  loyaltyEnabled?: boolean;
+  loyaltyEvery?: number;
+  loyaltyPercent?: number;
+  loyaltyMaxDiscount?: number;
 }
 
 export interface ReportData {

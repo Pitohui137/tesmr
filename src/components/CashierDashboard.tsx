@@ -372,6 +372,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
     const matchesFilter = filter === 'semua' || ord.status === filter;
     const matchesSearch = ord.customerName.toLowerCase().includes(searchQuery.toLowerCase()) || 
                           ord.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                          (ord.customerPhone || '').includes(searchQuery.replace(/[\s-]/g, '')) ||
                           ord.tableNumber.includes(searchQuery);
     return matchesFilter && matchesSearch;
   }).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -708,6 +709,9 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span className="text-[10px] text-slate-400 font-medium block mt-1">
                         {new Date(order.createdAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} • ID: {order.id}
                       </span>
+                      {order.customerPhone && (
+                        <span className="text-[10px] text-slate-500 font-semibold block mt-0.5">📱 {order.customerPhone}</span>
+                      )}
                     </div>
                     <div className="flex items-center gap-1">
                       {order.items.some(it => it.isCancelled) && (
@@ -785,6 +789,12 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span className="text-slate-500 text-[10px] font-bold uppercase tracking-wider">Total Tagihan</span>
                       <span className="text-sm font-extrabold text-brand-deep">{formatPrice(order.totalPrice)}</span>
                     </div>
+                    {(order.discountAmount || 0) > 0 && (
+                      <div className="flex justify-between items-center text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-2 py-1">
+                        <span>🎁 Voucher {order.voucherPercent}% terpakai</span>
+                        <span>-{formatPrice(order.discountAmount || 0)}</span>
+                      </div>
+                    )}
 
                     {(order.status === 'menunggu_verifikasi' || order.status === 'diproses') && (() => {
                       const eta = getOrderEta(order, queue, menuItems, Date.now());
@@ -953,6 +963,12 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span className="text-slate-500 font-bold">Pemesan</span>
                       <span className="font-extrabold text-slate-800">{live.customerName} • MEJA {live.tableNumber}</span>
                     </div>
+                    {(live.discountAmount || 0) > 0 && (
+                      <div className="flex justify-between text-xs text-emerald-700 font-semibold">
+                        <span>🎁 Voucher {live.voucherPercent}%</span>
+                        <span>-{formatPrice(live.discountAmount || 0)}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between items-center">
                       <span className="text-slate-500 font-bold text-xs">Total Tagihan</span>
                       <span className="text-lg font-black text-brand-deep">{formatPrice(live.totalPrice)}</span>
@@ -1047,6 +1063,12 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                       <span>Pelanggan:</span>
                       <span className="font-bold uppercase">{selectedReceiptOrder.customerName}</span>
                     </div>
+                    {selectedReceiptOrder.customerPhone && (
+                      <div className="flex justify-between">
+                        <span>No. HP:</span>
+                        <span className="font-bold">{selectedReceiptOrder.customerPhone}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between">
                       <span>Kasir:</span>
                       <span>Budi (Sistem)</span>
@@ -1074,6 +1096,18 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
 
                   {/* Totals */}
                   <div className="space-y-1 font-bold">
+                    {(selectedReceiptOrder.discountAmount || 0) > 0 && (
+                      <>
+                        <div className="flex justify-between text-[10px] text-slate-500 font-medium">
+                          <span>Subtotal:</span>
+                          <span>{formatPrice(selectedReceiptOrder.totalPrice + (selectedReceiptOrder.discountAmount || 0))}</span>
+                        </div>
+                        <div className="flex justify-between text-[10px] font-medium">
+                          <span>Voucher {selectedReceiptOrder.voucherPercent}%:</span>
+                          <span>-{formatPrice(selectedReceiptOrder.discountAmount || 0)}</span>
+                        </div>
+                      </>
+                    )}
                     <div className="flex justify-between text-xs">
                       <span>TOTAL:</span>
                       <span>{formatPrice(selectedReceiptOrder.totalPrice)}</span>

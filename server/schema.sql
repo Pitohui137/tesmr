@@ -10,7 +10,11 @@ CREATE TABLE IF NOT EXISTS settings (
   qris_merchant_name TEXT NOT NULL DEFAULT '',
   qris_code_text TEXT NOT NULL DEFAULT '',
   qris_image_url TEXT NOT NULL DEFAULT '',
-  best_seller_auto INTEGER NOT NULL DEFAULT 0
+  best_seller_auto INTEGER NOT NULL DEFAULT 0,
+  loyalty_enabled INTEGER NOT NULL DEFAULT 1,
+  loyalty_every INTEGER NOT NULL DEFAULT 5,
+  loyalty_percent INTEGER NOT NULL DEFAULT 10,
+  loyalty_max_discount INTEGER NOT NULL DEFAULT 25000
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -49,8 +53,28 @@ CREATE TABLE IF NOT EXISTS orders (
   has_payment_proof INTEGER NOT NULL DEFAULT 0,
   processed_at TEXT,
   archived_at TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  customer_phone TEXT NOT NULL DEFAULT '',
+  discount_amount INTEGER NOT NULL DEFAULT 0,
+  voucher_id TEXT,
+  voucher_percent INTEGER NOT NULL DEFAULT 0,
+  voucher_max INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders (customer_phone);
+
+-- Voucher diskon per nomor HP (didapat tiap N pesanan selesai, otomatis terpasang di pesanan berikutnya)
+CREATE TABLE IF NOT EXISTS vouchers (
+  id TEXT PRIMARY KEY,
+  phone TEXT NOT NULL,
+  percent INTEGER NOT NULL,
+  max_discount INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'aktif',
+  source_order_id TEXT NOT NULL UNIQUE,
+  used_order_id TEXT,
+  created_at TEXT NOT NULL,
+  used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vouchers_phone ON vouchers (phone, status);
 
 -- Bukti bayar QRIS (screenshot, data URL). Dipisah dari tabel orders agar
 -- daftar pesanan yang di-poll kasir tetap ringan.
