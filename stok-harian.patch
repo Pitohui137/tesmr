@@ -1,0 +1,648 @@
+diff --git a/server.ts b/server.ts
+index af682f4..58933fe 100644
+--- a/server.ts
++++ b/server.ts
+@@ -6,6 +6,7 @@ import { CafeSettings, MenuItem, Order, UserAccount, OrderItem, AppLog } from '.
+ import { MENUS } from './server/menu-data';
+ import { computeQueue, getOrderEta } from './src/utils/estimate';
+ import { computeAutoBestSellers } from './src/utils/bestseller';
++import { computeStockUsed, findStockShortage, parseDailyStock, stockMessage, stockRemainingOf } from './src/utils/stock';
+ import Database from 'better-sqlite3';
+ import bcrypt from 'bcryptjs';
+ import jwt from 'jsonwebtoken';
+@@ -739,12 +740,19 @@ app.post('/api/settings', authMiddleware, requireRole('owner', 'admin'), (req, r
+ // Best Seller otomatis (penjualan 30 hari terakhir), di-cache 60 detik
+ let bestSellerCache: { ids: Set<string>; ts: number } | null = null;
+ function menuForClients() {
+-  if (!dbState.settings.bestSellerAuto) return dbState.menu;
+-  if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
+-    bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
++  let list: any[] = dbState.menu;
++  if (dbState.settings.bestSellerAuto) {
++    if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
++      bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
++    }
++    const ids = bestSellerCache.ids;
++    list = list.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++  }
++  if (list.some(m => m.dailyStock != null)) {
++    const used = computeStockUsed(dbState.orders);
++    list = list.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: stockRemainingOf(m.dailyStock, used[m.id] || 0) }));
+   }
+-  const ids = bestSellerCache.ids;
+-  return dbState.menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++  return list;
+ }
+ 
+ app.get('/api/menu', (req, res) => {
+@@ -758,7 +766,7 @@ app.get('/api/queue', (req, res) => {
+   res.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
+ });
+ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
+   if (!name || !category || price === undefined) {
+     return res.status(400).json({ error: "Nama, kategori, dan harga harus diisi" });
+   }
+@@ -772,6 +780,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res)
+     imageUrl: imageUrl || "",
+     isAvailable: isAvailable !== undefined ? isAvailable : true,
+     isBestSeller: isBestSeller === true,
++    dailyStock: parseDailyStock(dailyStock) ?? null,
+     createdAt: new Date().toISOString(),
+     variants: Array.isArray(variants) && variants.length ? variants : undefined
+   };
+@@ -784,7 +793,8 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res)
+ 
+ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+   const { id } = req.params;
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
++  const stockValue = parseDailyStock(dailyStock);
+ 
+   const itemIndex = dbState.menu.findIndex(m => m.id === id);
+ 
+@@ -795,8 +805,8 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+   const user = (req as any).user as JwtPayload;
+   if (user.role !== 'owner') {
+     const current = dbState.menu[itemIndex];
+-    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller };
+-    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller };
++    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller, dailyStock: current.dailyStock ?? null };
++    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller, dailyStock: stockValue };
+     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
+       return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
+     }
+@@ -811,6 +821,7 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+     imageUrl: imageUrl !== undefined ? imageUrl : dbState.menu[itemIndex].imageUrl,
+     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
+     isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
++    dailyStock: stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null),
+     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
+   };
+ 
+@@ -1047,6 +1058,11 @@ app.post('/api/orders', (req, res) => {
+     return { menuId: m.id, name, price, quantity: Number(ni.quantity) || 1, notes: ni.notes || '', variant };
+   });
+ 
++  const short = findStockShortage(orderItems, dbState.menu, computeStockUsed(dbState.orders));
++  if (short) {
++    return res.status(409).json({ error: stockMessage(short.name, short.remaining) });
++  }
++
+   const newOrder: Order = {
+     id,
+     customerName,
+@@ -1211,6 +1227,17 @@ app.put('/api/orders/:id/items/:menuId/uncancel', authMiddleware, requireRole('o
+     return res.status(404).json({ error: "Item tidak ditemukan atau tidak dibatalkan" });
+   }
+ 
++  if (order.status !== 'dibatalkan') {
++    const restoreShort = findStockShortage(
++      [{ menuId: order.items[itemIndex].menuId, quantity: order.items[itemIndex].quantity }],
++      dbState.menu,
++      computeStockUsed(dbState.orders)
++    );
++    if (restoreShort) {
++      return res.status(409).json({ error: stockMessage(restoreShort.name, restoreShort.remaining) });
++    }
++  }
++
+   order.items[itemIndex] = {
+     ...order.items[itemIndex],
+     isCancelled: false,
+@@ -1379,6 +1406,11 @@ app.post('/api/orders/:id/items', (req, res) => {
+     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
+   }
+ 
++  const addShort = findStockShortage(itemsToAdd, dbState.menu, computeStockUsed(dbState.orders));
++  if (addShort) {
++    return res.status(409).json({ error: stockMessage(addShort.name, addShort.remaining) });
++  }
++
+   order.items.push(...itemsToAdd);
+ 
+   order.totalPrice = order.items
+diff --git a/server/migrate-daily-stock.sql b/server/migrate-daily-stock.sql
+new file mode 100644
+index 0000000..4624b82
+--- /dev/null
++++ b/server/migrate-daily-stock.sql
+@@ -0,0 +1,7 @@
++-- Migrasi: stok harian per menu (NULL = tidak terbatas)
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-daily-stock.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-daily-stock.sql
++-- Jalankan SEKALI pada database yang sudah ada, SEBELUM deploy kode baru.
++-- Jika muncul "duplicate column name: daily_stock", artinya sudah pernah dijalankan (aman diabaikan).
++
++ALTER TABLE menu ADD COLUMN daily_stock INTEGER;
+diff --git a/server/schema.sql b/server/schema.sql
+index 2620c79..2f8c093 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS menu (
+   image_url TEXT NOT NULL DEFAULT '',
+   is_available INTEGER NOT NULL DEFAULT 1,
+   is_best_seller INTEGER NOT NULL DEFAULT 0,
++  daily_stock INTEGER,
+   variants TEXT NOT NULL DEFAULT '',
+   created_at TEXT NOT NULL
+ );
+diff --git a/server/worker.ts b/server/worker.ts
+index 2f3c990..348a06a 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -3,6 +3,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+ import { SignJWT, jwtVerify } from 'jose';
+ import { computeQueue, getOrderEta } from '../src/utils/estimate';
+ import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
++import { computeStockUsed, dayStartMs, findStockShortage, parseDailyStock, stockMessage } from '../src/utils/stock';
+ 
+ // ====== Minimal D1 / Workers types ======
+ interface D1PreparedStatement {
+@@ -63,6 +64,7 @@ interface MenuRow {
+   image_url: string;
+   is_available: number;
+   is_best_seller?: number;
++  daily_stock?: number | null;
+   variants: string;
+   created_at: string;
+ }
+@@ -214,6 +216,7 @@ function toMenu(m: MenuRow) {
+     imageUrl: m.image_url,
+     isAvailable: !!m.is_available,
+     isBestSeller: !!m.is_best_seller,
++    dailyStock: m.daily_stock ?? null,
+     createdAt: m.created_at,
+     variants: variants && variants.length ? variants : undefined,
+   };
+@@ -270,6 +273,8 @@ const settingsCache: { data: any | null; ts: number } = { data: null, ts: 0 };
+ const ordersCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
+ const BEST_SELLER_TTL = 10 * 60 * 1000;
+ const bestSellerCache: { ids: Set<string> | null; ts: number } = { ids: null, ts: 0 };
++const stockCache: { used: Record<string, number> | null; ts: number } = { used: null, ts: 0 };
++const STOCK_TTL = 5000;
+ 
+ async function getMenuCached(db: D1Database): Promise<any[]> {
+   if (menuCache.data && Date.now() - menuCache.ts < MENU_TTL) return menuCache.data;
+@@ -299,12 +304,39 @@ async function getBestSellerIds(db: D1Database, menu: any[]): Promise<Set<string
+ }
+ 
+ // Menu untuk klien (pelanggan & dashboard): tambahkan penanda Best Seller otomatis bila diaktifkan.
++// Pemakaian stok hari ini (dari pesanan). Versi segar dipakai untuk validasi, versi cache untuk tampilan menu.
++async function getStockUsed(db: D1Database): Promise<Record<string, number>> {
++  const now = Date.now();
++  const rows = await db.prepare(
++    "SELECT items, status, created_at FROM orders WHERE created_at >= ? AND status != 'dibatalkan'"
++  ).bind(new Date(dayStartMs(now)).toISOString()).all<{ items: string; status: string; created_at: string }>();
++  const orders = rows.results.map(r => {
++    let items: any[] = [];
++    try { items = JSON.parse(r.items); } catch {}
++    return { status: r.status, createdAt: r.created_at, items };
++  });
++  return computeStockUsed(orders, now);
++}
++
++async function getStockUsedCached(db: D1Database): Promise<Record<string, number>> {
++  if (stockCache.used && Date.now() - stockCache.ts < STOCK_TTL) return stockCache.used;
++  stockCache.used = await getStockUsed(db);
++  stockCache.ts = Date.now();
++  return stockCache.used;
++}
++
+ async function getMenuForClients(db: D1Database): Promise<any[]> {
+-  const menu = await getMenuCached(db);
++  let menu = await getMenuCached(db);
+   const settings = await getSettingsCached(db);
+-  if (!settings.bestSellerAuto) return menu;
+-  const ids = await getBestSellerIds(db, menu);
+-  return menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++  if (settings.bestSellerAuto) {
++    const ids = await getBestSellerIds(db, menu);
++    menu = menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
++  }
++  if (menu.some(m => m.dailyStock != null)) {
++    const used = await getStockUsedCached(db);
++    menu = menu.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: Math.max(0, m.dailyStock - (used[m.id] || 0)) }));
++  }
++  return menu;
+ }
+ 
+ async function getSettingsCached(db: D1Database): Promise<any> {
+@@ -331,7 +363,7 @@ async function getOrdersCached(db: D1Database): Promise<any[]> {
+   return ordersCache.data;
+ }
+ 
+-function invalidateOrdersCache() { ordersCache.data = null; }
++function invalidateOrdersCache() { ordersCache.data = null; stockCache.used = null; }
+ 
+ // ====== Access tracking ======
+ function classifyUa(ua: string): { device: 'mobile' | 'desktop' | 'tablet'; isBot: boolean } {
+@@ -600,13 +632,13 @@ app.get('/api/queue', async (c) => {
+ });
+ 
+ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
+   if (!name || !category || price === undefined) return c.json({ error: 'Nama, kategori, dan harga harus diisi' }, 400);
+   const id = `menu-${Date.now()}`;
+   const variantsStr = Array.isArray(variants) && variants.length ? JSON.stringify(variants) : '';
+   await c.env.DB.prepare(
+-    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+-  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, variantsStr, new Date().toISOString()).run();
++    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, daily_stock, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
++  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, parseDailyStock(dailyStock) ?? null, variantsStr, new Date().toISOString()).run();
+   invalidateMenuCache();
+   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   return c.json({ message: 'Menu berhasil ditambahkan', item: toMenu(row!) }, 201);
+@@ -615,25 +647,27 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+ app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
+   const { id } = c.req.param();
+   const user = c.get('user') as { role: Role };
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
++  const stockValue = parseDailyStock(dailyStock);
+ 
+   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
+ 
+-  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined)) {
++  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined || stockValue !== undefined)) {
+     return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
+   }
+ 
+   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
+   await c.env.DB.prepare(
+     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
+-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), variants = COALESCE(?, variants) WHERE id = ?'
++    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, variants = COALESCE(?, variants) WHERE id = ?'
+   ).bind(
+     name ?? null, category ?? null,
+     price !== undefined ? Number(price) : null,
+     description ?? null, imageUrl ?? null,
+     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
+     isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
++    stockValue !== undefined ? 1 : 0, stockValue ?? null,
+     variantsStr ?? null, id
+   ).run();
+   invalidateMenuCache();
+@@ -779,6 +813,14 @@ app.post('/api/orders', async (c) => {
+     return { menuId: m.id, name, price, quantity: Number(ni.quantity) || 1, notes: ni.notes || '', variant };
+   });
+   const totalPrice = normItems.reduce((sum: number, it: any) => sum + (it.price * it.quantity), 0);
++
++  // Stok harian: tolak jika melebihi sisa stok
++  const stockLimited = normItems.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null);
++  if (stockLimited) {
++    const short = findStockShortage(normItems, menuRows, await getStockUsed(c.env.DB));
++    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
++  }
++
+   const stmt = c.env.DB.prepare(
+     'INSERT INTO orders (id, customer_name, table_number, items, total_price, payment_method, status, additional_amount, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)'
+   );
+@@ -789,6 +831,17 @@ app.post('/api/orders', async (c) => {
+     id = generateOrderId();
+     await stmt.bind(id, customerName, tableNumber, JSON.stringify(normItems), totalPrice, paymentMethod, 'menunggu_verifikasi', new Date().toISOString()).run();
+   }
++  if (stockLimited) {
++    // Cek ulang setelah insert: bila dua pesanan masuk bersamaan dan stok terlampaui, batalkan yang terakhir
++    const after = await getStockUsed(c.env.DB);
++    const over = menuRows.find((m: any) => m.dailyStock != null && normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > m.dailyStock);
++    if (over) {
++      await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
++      invalidateOrdersCache();
++      const own = normItems.filter((i: any) => i.menuId === over.id).reduce((s: number, i: any) => s + i.quantity, 0);
++      return c.json({ error: stockMessage(over.name, Math.max(0, over.dailyStock - ((after[over.id] || 0) - own))) }, 409);
++    }
++  }
+   await trackOrder(c);
+   invalidateOrdersCache();
+   const row = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(id).first<OrderRow>();
+@@ -919,6 +972,11 @@ app.put('/api/orders/:id/items/:menuId/uncancel', auth, requireRole('owner', 'ka
+   let items = JSON.parse(order.items);
+   const idx = items.findIndex((i: any) => i.menuId === menuId && (i.variant || '') === (variant || '') && i.isCancelled);
+   if (idx === -1) return c.json({ error: 'Item tidak ditemukan atau tidak dibatalkan' }, 404);
++  if (order.status !== 'dibatalkan') {
++    const menuRows = await getMenuCached(c.env.DB);
++    const short = findStockShortage([{ menuId: items[idx].menuId, quantity: items[idx].quantity }], menuRows, await getStockUsed(c.env.DB));
++    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
++  }
+   items[idx] = { ...items[idx], isCancelled: false, cancelledAt: undefined };
+   const total = items.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+   const additionalAmount = computeAdditionalAmount(items);
+@@ -1001,6 +1059,10 @@ app.post('/api/orders/:id/items', async (c) => {
+     }
+     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
+   }
++  if (itemsToAdd.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null)) {
++    const short = findStockShortage(itemsToAdd, menuRows, await getStockUsed(c.env.DB));
++    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
++  }
+   itemsToAdd.forEach((ni: any) => current.push(ni));
+   const total = current.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
+   const additionalAmount = computeAdditionalAmount(current);
+diff --git a/src/components/CashierDashboard.tsx b/src/components/CashierDashboard.tsx
+index ca65f07..0953711 100644
+--- a/src/components/CashierDashboard.tsx
++++ b/src/components/CashierDashboard.tsx
+@@ -623,6 +623,11 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                                 {({ makanan: 'Food Menu', kudapan: 'Kudapan', dessert: 'Dessert', minuman: 'Minuman' } as any)[item.category] || item.category}
+                               </span>
+                               <span className="text-xs font-extrabold text-brand-forest">{formatPrice(item.price)}</span>
++                              {item.dailyStock != null && (
++                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
++                                  Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
++                                </span>
++                              )}
+                             </div>
+                           </div>
+                           {item.variants && item.variants.length > 0 ? (
+@@ -1143,7 +1148,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                     <span>{error}</span>
+                   </div>
+                 )}
+-                {menuItems.filter(m => m.isAvailable).map(menuItem => {
++                {menuItems.filter(m => m.isAvailable && !(m.stockRemaining != null && m.stockRemaining <= 0)).map(menuItem => {
+                   const selV = menuItem.variants && menuItem.variants.length
+                     ? (menuItem.variants.find(v => v.label === (addVariants[menuItem.id] || menuItem.variants![0].label) && v.isAvailable !== false)
+                       || menuItem.variants.find(v => v.isAvailable !== false)
+diff --git a/src/components/CustomerView.tsx b/src/components/CustomerView.tsx
+index 8f5b63d..b75e4ae 100644
+--- a/src/components/CustomerView.tsx
++++ b/src/components/CustomerView.tsx
+@@ -4,8 +4,10 @@ import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, R
+ import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+ import { compressImage } from '../utils/image';
+ import { estimateMinutes, formatClock } from '../utils/estimate';
++import { stockMessage } from '../utils/stock';
+ 
+ const isBestSellerItem = (m: { isBestSeller?: boolean; isAutoBestSeller?: boolean }) => !!(m.isBestSeller || m.isAutoBestSeller);
++const isStockOut = (m: { stockRemaining?: number | null }) => m.stockRemaining != null && m.stockRemaining <= 0;
+ 
+ const CATEGORY_LABELS: Record<string, string> = {
+   makanan: 'Food Menu',
+@@ -84,6 +86,28 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+     return () => clearInterval(t);
+   }, []);
+ 
++  // Pemberitahuan stok (mis. "Stok Nasi Goreng tinggal 2 porsi hari ini")
++  const [stockNotice, setStockNotice] = useState('');
++  const showStockNotice = (msg: string) => {
++    setStockNotice(msg);
++    window.setTimeout(() => setStockNotice(''), 2500);
++  };
++  const stockLeftOf = (menuId: string): number | null => {
++    const m = menu.find(x => x.id === menuId);
++    return m && m.stockRemaining != null ? m.stockRemaining : null;
++  };
++  const qtyOfMenuIn = (map: Record<string, number>, menuId: string) =>
++    Object.entries(map).reduce((sum, [k, q]) => (k.split('::')[0] === menuId ? sum + q : sum), 0);
++  // true bila penambahan melebihi sisa stok (dan menampilkan pemberitahuan)
++  const exceedsStock = (map: Record<string, number>, key: string, delta: number) => {
++    if (delta <= 0) return false;
++    const menuId = key.split('::')[0];
++    const left = stockLeftOf(menuId);
++    if (left === null || qtyOfMenuIn(map, menuId) + delta <= left) return false;
++    showStockNotice(stockMessage(menu.find(m => m.id === menuId)?.name || 'Menu', left));
++    return true;
++  };
++
+   // Beban antrean saat ini (untuk estimasi di checkout)
+   const [queueLoad, setQueueLoad] = useState<{ waitMinutes: number; inQueue: number } | null>(null);
+   useEffect(() => {
+@@ -206,6 +230,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+   };
+ 
+   const updateCartQuantity = (id: string, delta: number) => {
++    if (exceedsStock(cart, id, delta)) return;
+     setCart(prev => {
+       const current = prev[id] || 0;
+       const next = current + delta;
+@@ -374,6 +399,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+   };
+ 
+   const updateAddCartQty = (key: string, delta: number) => {
++    if (exceedsStock(addCart, key, delta)) return;
+     setAddCart(prev => {
+       const current = prev[key] || 0;
+       const next = current + delta;
+@@ -651,7 +677,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                   const selectedV = getSelectedVariant(item);
+                   const cartKey = cartKeyOf(item, selectedV?.label);
+                   const allVariantsOut = item.variants && item.variants.length > 0 && item.variants.every(v => v.isAvailable === false);
+-                  const isOut = !item.isAvailable || !!allVariantsOut;
++                  const isOut = !item.isAvailable || !!allVariantsOut || isStockOut(item);
+                   return (
+                   <motion.div
+                     key={item.id}
+@@ -690,6 +716,11 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                           <Flame size={10} /> Best Seller
+                         </span>
+                       )}
++                      {!isOut && item.stockRemaining != null && item.stockRemaining <= 5 && (
++                        <span className="absolute bottom-2 left-2 text-[9px] font-extrabold px-1.5 py-0.5 rounded-md bg-white/95 text-red-600 shadow-sm">
++                          Sisa {item.stockRemaining}
++                        </span>
++                      )}
+                     </div>
+                     <div className="p-2.5 space-y-1.5">
+                       <h3 className="font-bold text-slate-800 text-xs leading-tight line-clamp-2 min-h-[2rem]">{item.name}</h3>
+@@ -756,6 +787,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+           )}
+         </div>
+ 
++        {stockNotice && (
++          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-[90vw] bg-slate-900 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-xl text-center">
++            {stockNotice}
++          </div>
++        )}
++
+         {/* Floating Cart Button */}
+         {getCartItemCount() > 0 && (
+           <div className="fixed bottom-0 left-0 right-0 p-4 bg-transparent pointer-events-none z-30">
+@@ -1405,7 +1442,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                       <span>{error}</span>
+                     </div>
+                   )}
+-                  {menu.filter(m => m.isAvailable).map(item => {
++                  {menu.filter(m => m.isAvailable && !isStockOut(m)).map(item => {
+                     const sv = getSelectedVariant(item);
+                     const aKey = cartKeyOf(item, sv?.label);
+                     return (
+@@ -1453,7 +1490,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
+                     </div>
+                     );
+                   })}
+-                  {menu.filter(m => m.isAvailable).length === 0 && (
++                  {menu.filter(m => m.isAvailable && !isStockOut(m)).length === 0 && (
+                     <p className="text-center text-slate-400 text-sm py-8 font-medium">Tidak ada menu tersedia</p>
+                   )}
+                 </div>
+diff --git a/src/components/OwnerDashboard.tsx b/src/components/OwnerDashboard.tsx
+index adfa2eb..ac66a61 100644
+--- a/src/components/OwnerDashboard.tsx
++++ b/src/components/OwnerDashboard.tsx
+@@ -56,6 +56,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+   const [menuFormImageUrl, setMenuFormImageUrl] = useState<string>('');
+   const [menuFormAvailable, setMenuFormAvailable] = useState<boolean>(true);
+   const [menuFormBestSeller, setMenuFormBestSeller] = useState<boolean>(false);
++  const [menuFormDailyStock, setMenuFormDailyStock] = useState<string>('');
+   const [menuFormVariants, setMenuFormVariants] = useState<MenuVariant[]>([]);
+ 
+   // Report period state
+@@ -237,6 +238,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       setMenuFormImageUrl(item.imageUrl);
+       setMenuFormAvailable(item.isAvailable);
+       setMenuFormBestSeller(!!item.isBestSeller);
++      setMenuFormDailyStock(item.dailyStock != null ? String(item.dailyStock) : '');
+       setMenuFormVariants(item.variants?.length ? item.variants.map(v => ({ ...v })) : []);
+     } else {
+       setEditingMenuItem(null);
+@@ -247,6 +249,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       setMenuFormImageUrl('');
+       setMenuFormAvailable(true);
+       setMenuFormBestSeller(false);
++      setMenuFormDailyStock('');
+       setMenuFormVariants([]);
+     }
+     setIsMenuModalOpen(true);
+@@ -273,6 +276,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+       imageUrl: menuFormImageUrl.trim(),
+       isAvailable: menuFormAvailable,
+       isBestSeller: menuFormBestSeller,
++      dailyStock: menuFormDailyStock.trim() === '' ? null : Math.max(0, Math.floor(Number(menuFormDailyStock) || 0)),
+       variants: cleanVariants.length ? cleanVariants : undefined
+     };
+ 
+@@ -968,6 +972,11 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                               <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
+                             </span>
+                           )}
++                          {item.dailyStock != null && (
++                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
++                              Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
++                            </span>
++                          )}
+                         </h4>
+                         <span className={`text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded ${
+                           item.category === 'makanan' ? 'bg-red-50 text-red-600' :
+@@ -1809,6 +1818,23 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                   </label>
+                 </div>
+ 
++                <div className="space-y-1.5">
++                  <label htmlFor="dailyStock" className="block text-slate-500 uppercase tracking-wider">Stok Harian (porsi)</label>
++                  <input
++                    id="dailyStock"
++                    type="number"
++                    min="0"
++                    inputMode="numeric"
++                    value={menuFormDailyStock}
++                    onChange={(e) => setMenuFormDailyStock(e.target.value)}
++                    placeholder="Kosongkan = tidak terbatas"
++                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-800"
++                  />
++                  <p className="text-[10px] text-slate-400 font-normal leading-normal">
++                    Batas porsi per hari. Menu otomatis habis saat stok terpakai, kembali penuh tiap pergantian hari (00.00 WIB), dan stok kembali bila pesanan dibatalkan.
++                  </p>
++                </div>
++
+                 <div className="flex items-center gap-2">
+                   <input
+                     type="checkbox"
+diff --git a/src/types.ts b/src/types.ts
+index ef6267a..9769f14 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -30,6 +30,8 @@ export interface MenuItem {
+   isAvailable: boolean;
+   isBestSeller?: boolean;
+   isAutoBestSeller?: boolean;
++  dailyStock?: number | null;      // batas porsi per hari (null/kosong = tidak terbatas)
++  stockRemaining?: number | null;  // sisa stok hari ini (dihitung server)
+   createdAt: string;
+   variants?: MenuVariant[];
+ }
+diff --git a/src/utils/stock.ts b/src/utils/stock.ts
+new file mode 100644
+index 0000000..791c73e
+--- /dev/null
++++ b/src/utils/stock.ts
+@@ -0,0 +1,76 @@
++// Stok harian per menu.
++// Pemakaian stok DIHITUNG dari pesanan hari ini (bukan counter terpisah), sehingga
++// otomatis kembali saat pesanan/item dibatalkan atau dihapus, dan otomatis reset tiap hari.
++// Pesanan yang menunggu verifikasi tetap menahan stok sampai dibatalkan kasir.
++
++// Pergantian hari mengikuti zona waktu cafe. 7 = WIB (UTC+7). Ubah jika di WITA (8) / WIT (9).
++export const STOCK_TZ_OFFSET_HOURS = 7;
++
++const HOUR = 3600000;
++const DAY = 24 * HOUR;
++
++// Awal hari ini (00:00 waktu cafe) dalam epoch ms
++export function dayStartMs(now = Date.now()): number {
++  const off = STOCK_TZ_OFFSET_HOURS * HOUR;
++  return Math.floor((now + off) / DAY) * DAY - off;
++}
++
++interface UsageOrder {
++  status: string;
++  createdAt: string;
++  items: { menuId: string; quantity: number; isCancelled?: boolean }[];
++}
++
++// Jumlah porsi per menuId yang sudah terpakai hari ini
++export function computeStockUsed(orders: UsageOrder[], now = Date.now()): Record<string, number> {
++  const start = dayStartMs(now);
++  const used: Record<string, number> = {};
++  for (const o of orders) {
++    if (o.status === 'dibatalkan') continue;
++    const t = Date.parse(o.createdAt);
++    if (!(t >= start)) continue;
++    for (const it of o.items || []) {
++      if (it.isCancelled) continue;
++      used[it.menuId] = (used[it.menuId] || 0) + (Number(it.quantity) || 0);
++    }
++  }
++  return used;
++}
++
++// Sisa stok hari ini; null = tidak dibatasi
++export function stockRemainingOf(dailyStock: number | null | undefined, used: number): number | null {
++  if (dailyStock === null || dailyStock === undefined) return null;
++  return Math.max(0, dailyStock - used);
++}
++
++export function stockMessage(name: string, remaining: number): string {
++  return remaining <= 0
++    ? `${name} sudah habis untuk hari ini`
++    : `Stok ${name} tinggal ${remaining} porsi hari ini`;
++}
++
++// Cek apakah permintaan melebihi stok. Mengembalikan menu pertama yang kurang, atau null jika aman.
++export function findStockShortage(
++  requested: { menuId: string; quantity: number }[],
++  menu: { id: string; name: string; dailyStock?: number | null }[],
++  used: Record<string, number>
++): { name: string; remaining: number } | null {
++  const want: Record<string, number> = {};
++  for (const r of requested) want[r.menuId] = (want[r.menuId] || 0) + (Number(r.quantity) || 0);
++  for (const [menuId, qty] of Object.entries(want)) {
++    const m = menu.find(x => x.id === menuId);
++    if (!m || m.dailyStock === null || m.dailyStock === undefined) continue;
++    const remaining = Math.max(0, m.dailyStock - (used[menuId] || 0));
++    if (qty > remaining) return { name: m.name, remaining };
++  }
++  return null;
++}
++
++// Baca nilai stok dari input: undefined = tidak dikirim, null = tidak terbatas, angka >= 0
++export function parseDailyStock(v: unknown): number | null | undefined {
++  if (v === undefined) return undefined;
++  if (v === null || v === '') return null;
++  const n = Number(v);
++  if (!Number.isFinite(n)) return undefined;
++  return Math.max(0, Math.floor(n));
++}

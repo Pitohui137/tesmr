@@ -56,6 +56,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
   const [menuFormImageUrl, setMenuFormImageUrl] = useState<string>('');
   const [menuFormAvailable, setMenuFormAvailable] = useState<boolean>(true);
   const [menuFormBestSeller, setMenuFormBestSeller] = useState<boolean>(false);
+  const [menuFormDailyStock, setMenuFormDailyStock] = useState<string>('');
   const [menuFormVariants, setMenuFormVariants] = useState<MenuVariant[]>([]);
 
   // Report period state
@@ -237,6 +238,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       setMenuFormImageUrl(item.imageUrl);
       setMenuFormAvailable(item.isAvailable);
       setMenuFormBestSeller(!!item.isBestSeller);
+      setMenuFormDailyStock(item.dailyStock != null ? String(item.dailyStock) : '');
       setMenuFormVariants(item.variants?.length ? item.variants.map(v => ({ ...v })) : []);
     } else {
       setEditingMenuItem(null);
@@ -247,6 +249,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       setMenuFormImageUrl('');
       setMenuFormAvailable(true);
       setMenuFormBestSeller(false);
+      setMenuFormDailyStock('');
       setMenuFormVariants([]);
     }
     setIsMenuModalOpen(true);
@@ -273,6 +276,7 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
       imageUrl: menuFormImageUrl.trim(),
       isAvailable: menuFormAvailable,
       isBestSeller: menuFormBestSeller,
+      dailyStock: menuFormDailyStock.trim() === '' ? null : Math.max(0, Math.floor(Number(menuFormDailyStock) || 0)),
       variants: cleanVariants.length ? cleanVariants : undefined
     };
 
@@ -966,6 +970,11 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                           {(item.isBestSeller || item.isAutoBestSeller) && (
                             <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
                               <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
+                            </span>
+                          )}
+                          {item.dailyStock != null && (
+                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+                              Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
                             </span>
                           )}
                         </h4>
@@ -1807,6 +1816,23 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                   <label htmlFor="isAvailable" className="text-slate-700 font-bold select-none cursor-pointer">
                     Stok Tersedia (Aktifkan Menu)
                   </label>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label htmlFor="dailyStock" className="block text-slate-500 uppercase tracking-wider">Stok Harian (porsi)</label>
+                  <input
+                    id="dailyStock"
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={menuFormDailyStock}
+                    onChange={(e) => setMenuFormDailyStock(e.target.value)}
+                    placeholder="Kosongkan = tidak terbatas"
+                    className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-800"
+                  />
+                  <p className="text-[10px] text-slate-400 font-normal leading-normal">
+                    Batas porsi per hari. Menu otomatis habis saat stok terpakai, kembali penuh tiap pergantian hari (00.00 WIB), dan stok kembali bila pesanan dibatalkan.
+                  </p>
                 </div>
 
                 <div className="flex items-center gap-2">

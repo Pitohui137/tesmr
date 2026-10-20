@@ -3,6 +3,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { SignJWT, jwtVerify } from 'jose';
 import { computeQueue, getOrderEta } from '../src/utils/estimate';
 import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
+import { computeStockUsed, dayStartMs, findStockShortage, parseDailyStock, stockMessage } from '../src/utils/stock';
 
 // ====== Minimal D1 / Workers types ======
 interface D1PreparedStatement {
@@ -63,6 +64,7 @@ interface MenuRow {
   image_url: string;
   is_available: number;
   is_best_seller?: number;
+  daily_stock?: number | null;
   variants: string;
   created_at: string;
 }
@@ -214,6 +216,7 @@ function toMenu(m: MenuRow) {
     imageUrl: m.image_url,
     isAvailable: !!m.is_available,
     isBestSeller: !!m.is_best_seller,
+    dailyStock: m.daily_stock ?? null,
     createdAt: m.created_at,
     variants: variants && variants.length ? variants : undefined,
   };
@@ -270,6 +273,8 @@ const settingsCache: { data: any | null; ts: number } = { data: null, ts: 0 };
 const ordersCache: { data: any[] | null; ts: number } = { data: null, ts: 0 };
 const BEST_SELLER_TTL = 10 * 60 * 1000;
 const bestSellerCache: { ids: Set<string> | null; ts: number } = { ids: null, ts: 0 };
+const stockCache: { used: Record<string, number> | null; ts: number } = { used: null, ts: 0 };
+const STOCK_TTL = 5000;
 
 async function getMenuCached(db: D1Database): Promise<any[]> {
   if (menuCache.data && Date.now() - menuCache.ts < MENU_TTL) return menuCache.data;
@@ -299,12 +304,39 @@ async function getBestSellerIds(db: D1Database, menu: any[]): Promise<Set<string
 }
 
 // Menu untuk klien (pelanggan & dashboard): tambahkan penanda Best Seller otomatis bila diaktifkan.
+// Pemakaian stok hari ini (dari pesanan). Versi segar dipakai untuk validasi, versi cache untuk tampilan menu.
+async function getStockUsed(db: D1Database): Promise<Record<string, number>> {
+  const now = Date.now();
+  const rows = await db.prepare(
+    "SELECT items, status, created_at FROM orders WHERE created_at >= ? AND status != 'dibatalkan'"
+  ).bind(new Date(dayStartMs(now)).toISOString()).all<{ items: string; status: string; created_at: string }>();
+  const orders = rows.results.map(r => {
+    let items: any[] = [];
+    try { items = JSON.parse(r.items); } catch {}
+    return { status: r.status, createdAt: r.created_at, items };
+  });
+  return computeStockUsed(orders, now);
+}
+
+async function getStockUsedCached(db: D1Database): Promise<Record<string, number>> {
+  if (stockCache.used && Date.now() - stockCache.ts < STOCK_TTL) return stockCache.used;
+  stockCache.used = await getStockUsed(db);
+  stockCache.ts = Date.now();
+  return stockCache.used;
+}
+
 async function getMenuForClients(db: D1Database): Promise<any[]> {
-  const menu = await getMenuCached(db);
+  let menu = await getMenuCached(db);
   const settings = await getSettingsCached(db);
-  if (!settings.bestSellerAuto) return menu;
-  const ids = await getBestSellerIds(db, menu);
-  return menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+  if (settings.bestSellerAuto) {
+    const ids = await getBestSellerIds(db, menu);
+    menu = menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+  }
+  if (menu.some(m => m.dailyStock != null)) {
+    const used = await getStockUsedCached(db);
+    menu = menu.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: Math.max(0, m.dailyStock - (used[m.id] || 0)) }));
+  }
+  return menu;
 }
 
 async function getSettingsCached(db: D1Database): Promise<any> {
@@ -331,7 +363,7 @@ async function getOrdersCached(db: D1Database): Promise<any[]> {
   return ordersCache.data;
 }
 
-function invalidateOrdersCache() { ordersCache.data = null; }
+function invalidateOrdersCache() { ordersCache.data = null; stockCache.used = null; }
 
 // ====== Access tracking ======
 function classifyUa(ua: string): { device: 'mobile' | 'desktop' | 'tablet'; isBot: boolean } {
@@ -600,13 +632,13 @@ app.get('/api/queue', async (c) => {
 });
 
 app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
   if (!name || !category || price === undefined) return c.json({ error: 'Nama, kategori, dan harga harus diisi' }, 400);
   const id = `menu-${Date.now()}`;
   const variantsStr = Array.isArray(variants) && variants.length ? JSON.stringify(variants) : '';
   await c.env.DB.prepare(
-    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, variantsStr, new Date().toISOString()).run();
+    'INSERT INTO menu (id, name, category, price, description, image_url, is_available, is_best_seller, daily_stock, variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(id, name, category, Number(price), description || '', imageUrl || '', isAvailable !== undefined ? (isAvailable ? 1 : 0) : 1, isBestSeller === true ? 1 : 0, parseDailyStock(dailyStock) ?? null, variantsStr, new Date().toISOString()).run();
   invalidateMenuCache();
   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   return c.json({ message: 'Menu berhasil ditambahkan', item: toMenu(row!) }, 201);
@@ -615,25 +647,27 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
 app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
   const { id } = c.req.param();
   const user = c.get('user') as { role: Role };
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = await c.req.json().catch(() => ({}));
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
+  const stockValue = parseDailyStock(dailyStock);
 
   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
 
-  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined)) {
+  if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined || stockValue !== undefined)) {
     return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
   }
 
   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
   await c.env.DB.prepare(
     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), variants = COALESCE(?, variants) WHERE id = ?'
+    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, variants = COALESCE(?, variants) WHERE id = ?'
   ).bind(
     name ?? null, category ?? null,
     price !== undefined ? Number(price) : null,
     description ?? null, imageUrl ?? null,
     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
     isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
+    stockValue !== undefined ? 1 : 0, stockValue ?? null,
     variantsStr ?? null, id
   ).run();
   invalidateMenuCache();
@@ -779,6 +813,14 @@ app.post('/api/orders', async (c) => {
     return { menuId: m.id, name, price, quantity: Number(ni.quantity) || 1, notes: ni.notes || '', variant };
   });
   const totalPrice = normItems.reduce((sum: number, it: any) => sum + (it.price * it.quantity), 0);
+
+  // Stok harian: tolak jika melebihi sisa stok
+  const stockLimited = normItems.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null);
+  if (stockLimited) {
+    const short = findStockShortage(normItems, menuRows, await getStockUsed(c.env.DB));
+    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
+  }
+
   const stmt = c.env.DB.prepare(
     'INSERT INTO orders (id, customer_name, table_number, items, total_price, payment_method, status, additional_amount, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)'
   );
@@ -788,6 +830,17 @@ app.post('/api/orders', async (c) => {
   } catch (e) {
     id = generateOrderId();
     await stmt.bind(id, customerName, tableNumber, JSON.stringify(normItems), totalPrice, paymentMethod, 'menunggu_verifikasi', new Date().toISOString()).run();
+  }
+  if (stockLimited) {
+    // Cek ulang setelah insert: bila dua pesanan masuk bersamaan dan stok terlampaui, batalkan yang terakhir
+    const after = await getStockUsed(c.env.DB);
+    const over = menuRows.find((m: any) => m.dailyStock != null && normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > m.dailyStock);
+    if (over) {
+      await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
+      invalidateOrdersCache();
+      const own = normItems.filter((i: any) => i.menuId === over.id).reduce((s: number, i: any) => s + i.quantity, 0);
+      return c.json({ error: stockMessage(over.name, Math.max(0, over.dailyStock - ((after[over.id] || 0) - own))) }, 409);
+    }
   }
   await trackOrder(c);
   invalidateOrdersCache();
@@ -919,6 +972,11 @@ app.put('/api/orders/:id/items/:menuId/uncancel', auth, requireRole('owner', 'ka
   let items = JSON.parse(order.items);
   const idx = items.findIndex((i: any) => i.menuId === menuId && (i.variant || '') === (variant || '') && i.isCancelled);
   if (idx === -1) return c.json({ error: 'Item tidak ditemukan atau tidak dibatalkan' }, 404);
+  if (order.status !== 'dibatalkan') {
+    const menuRows = await getMenuCached(c.env.DB);
+    const short = findStockShortage([{ menuId: items[idx].menuId, quantity: items[idx].quantity }], menuRows, await getStockUsed(c.env.DB));
+    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
+  }
   items[idx] = { ...items[idx], isCancelled: false, cancelledAt: undefined };
   const total = items.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);
   const additionalAmount = computeAdditionalAmount(items);
@@ -1000,6 +1058,10 @@ app.post('/api/orders/:id/items', async (c) => {
       price = first.price;
     }
     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
+  }
+  if (itemsToAdd.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null)) {
+    const short = findStockShortage(itemsToAdd, menuRows, await getStockUsed(c.env.DB));
+    if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
   }
   itemsToAdd.forEach((ni: any) => current.push(ni));
   const total = current.filter((i: any) => !i.isCancelled).reduce((s: number, i: any) => s + (i.price * i.quantity), 0);

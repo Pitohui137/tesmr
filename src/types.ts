@@ -30,6 +30,8 @@ export interface MenuItem {
   isAvailable: boolean;
   isBestSeller?: boolean;
   isAutoBestSeller?: boolean;
+  dailyStock?: number | null;      // batas porsi per hari (null/kosong = tidak terbatas)
+  stockRemaining?: number | null;  // sisa stok hari ini (dihitung server)
   createdAt: string;
   variants?: MenuVariant[];
 }

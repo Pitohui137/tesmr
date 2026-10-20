@@ -4,8 +4,10 @@ import { ShoppingBag, Search, ChevronRight, Check, MapPin, Phone, AlertCircle, R
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 import { compressImage } from '../utils/image';
 import { estimateMinutes, formatClock } from '../utils/estimate';
+import { stockMessage } from '../utils/stock';
 
 const isBestSellerItem = (m: { isBestSeller?: boolean; isAutoBestSeller?: boolean }) => !!(m.isBestSeller || m.isAutoBestSeller);
+const isStockOut = (m: { stockRemaining?: number | null }) => m.stockRemaining != null && m.stockRemaining <= 0;
 
 const CATEGORY_LABELS: Record<string, string> = {
   makanan: 'Food Menu',
@@ -83,6 +85,28 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
     const t = setInterval(() => setNowTick(Date.now()), 30000);
     return () => clearInterval(t);
   }, []);
+
+  // Pemberitahuan stok (mis. "Stok Nasi Goreng tinggal 2 porsi hari ini")
+  const [stockNotice, setStockNotice] = useState('');
+  const showStockNotice = (msg: string) => {
+    setStockNotice(msg);
+    window.setTimeout(() => setStockNotice(''), 2500);
+  };
+  const stockLeftOf = (menuId: string): number | null => {
+    const m = menu.find(x => x.id === menuId);
+    return m && m.stockRemaining != null ? m.stockRemaining : null;
+  };
+  const qtyOfMenuIn = (map: Record<string, number>, menuId: string) =>
+    Object.entries(map).reduce((sum, [k, q]) => (k.split('::')[0] === menuId ? sum + q : sum), 0);
+  // true bila penambahan melebihi sisa stok (dan menampilkan pemberitahuan)
+  const exceedsStock = (map: Record<string, number>, key: string, delta: number) => {
+    if (delta <= 0) return false;
+    const menuId = key.split('::')[0];
+    const left = stockLeftOf(menuId);
+    if (left === null || qtyOfMenuIn(map, menuId) + delta <= left) return false;
+    showStockNotice(stockMessage(menu.find(m => m.id === menuId)?.name || 'Menu', left));
+    return true;
+  };
 
   // Beban antrean saat ini (untuk estimasi di checkout)
   const [queueLoad, setQueueLoad] = useState<{ waitMinutes: number; inQueue: number } | null>(null);
@@ -206,6 +230,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   };
 
   const updateCartQuantity = (id: string, delta: number) => {
+    if (exceedsStock(cart, id, delta)) return;
     setCart(prev => {
       const current = prev[id] || 0;
       const next = current + delta;
@@ -374,6 +399,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
   };
 
   const updateAddCartQty = (key: string, delta: number) => {
+    if (exceedsStock(addCart, key, delta)) return;
     setAddCart(prev => {
       const current = prev[key] || 0;
       const next = current + delta;
@@ -651,7 +677,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                   const selectedV = getSelectedVariant(item);
                   const cartKey = cartKeyOf(item, selectedV?.label);
                   const allVariantsOut = item.variants && item.variants.length > 0 && item.variants.every(v => v.isAvailable === false);
-                  const isOut = !item.isAvailable || !!allVariantsOut;
+                  const isOut = !item.isAvailable || !!allVariantsOut || isStockOut(item);
                   return (
                   <motion.div
                     key={item.id}
@@ -688,6 +714,11 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                       {isBestSellerItem(item) && (
                         <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] uppercase font-extrabold tracking-wider px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow-sm">
                           <Flame size={10} /> Best Seller
+                        </span>
+                      )}
+                      {!isOut && item.stockRemaining != null && item.stockRemaining <= 5 && (
+                        <span className="absolute bottom-2 left-2 text-[9px] font-extrabold px-1.5 py-0.5 rounded-md bg-white/95 text-red-600 shadow-sm">
+                          Sisa {item.stockRemaining}
                         </span>
                       )}
                     </div>
@@ -755,6 +786,12 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
             </motion.div>
           )}
         </div>
+
+        {stockNotice && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-[90vw] bg-slate-900 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-xl text-center">
+            {stockNotice}
+          </div>
+        )}
 
         {/* Floating Cart Button */}
         {getCartItemCount() > 0 && (
@@ -1405,7 +1442,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                       <span>{error}</span>
                     </div>
                   )}
-                  {menu.filter(m => m.isAvailable).map(item => {
+                  {menu.filter(m => m.isAvailable && !isStockOut(m)).map(item => {
                     const sv = getSelectedVariant(item);
                     const aKey = cartKeyOf(item, sv?.label);
                     return (
@@ -1453,7 +1490,7 @@ export default function CustomerView({ settings, menu, onOrderPlaced }: Customer
                     </div>
                     );
                   })}
-                  {menu.filter(m => m.isAvailable).length === 0 && (
+                  {menu.filter(m => m.isAvailable && !isStockOut(m)).length === 0 && (
                     <p className="text-center text-slate-400 text-sm py-8 font-medium">Tidak ada menu tersedia</p>
                   )}
                 </div>

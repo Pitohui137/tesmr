@@ -623,6 +623,11 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                                 {({ makanan: 'Food Menu', kudapan: 'Kudapan', dessert: 'Dessert', minuman: 'Minuman' } as any)[item.category] || item.category}
                               </span>
                               <span className="text-xs font-extrabold text-brand-forest">{formatPrice(item.price)}</span>
+                              {item.dailyStock != null && (
+                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+                                  Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
+                                </span>
+                              )}
                             </div>
                           </div>
                           {item.variants && item.variants.length > 0 ? (
@@ -1143,7 +1148,7 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                     <span>{error}</span>
                   </div>
                 )}
-                {menuItems.filter(m => m.isAvailable).map(menuItem => {
+                {menuItems.filter(m => m.isAvailable && !(m.stockRemaining != null && m.stockRemaining <= 0)).map(menuItem => {
                   const selV = menuItem.variants && menuItem.variants.length
                     ? (menuItem.variants.find(v => v.label === (addVariants[menuItem.id] || menuItem.variants![0].label) && v.isAvailable !== false)
                       || menuItem.variants.find(v => v.isAvailable !== false)

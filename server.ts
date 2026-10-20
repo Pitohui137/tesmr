@@ -6,6 +6,7 @@ import { CafeSettings, MenuItem, Order, UserAccount, OrderItem, AppLog } from '.
 import { MENUS } from './server/menu-data';
 import { computeQueue, getOrderEta } from './src/utils/estimate';
 import { computeAutoBestSellers } from './src/utils/bestseller';
+import { computeStockUsed, findStockShortage, parseDailyStock, stockMessage, stockRemainingOf } from './src/utils/stock';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -739,12 +740,19 @@ app.post('/api/settings', authMiddleware, requireRole('owner', 'admin'), (req, r
 // Best Seller otomatis (penjualan 30 hari terakhir), di-cache 60 detik
 let bestSellerCache: { ids: Set<string>; ts: number } | null = null;
 function menuForClients() {
-  if (!dbState.settings.bestSellerAuto) return dbState.menu;
-  if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
-    bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
+  let list: any[] = dbState.menu;
+  if (dbState.settings.bestSellerAuto) {
+    if (!bestSellerCache || Date.now() - bestSellerCache.ts > 60_000) {
+      bestSellerCache = { ids: new Set(computeAutoBestSellers(dbState.orders, dbState.menu)), ts: Date.now() };
+    }
+    const ids = bestSellerCache.ids;
+    list = list.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
   }
-  const ids = bestSellerCache.ids;
-  return dbState.menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+  if (list.some(m => m.dailyStock != null)) {
+    const used = computeStockUsed(dbState.orders);
+    list = list.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: stockRemainingOf(m.dailyStock, used[m.id] || 0) }));
+  }
+  return list;
 }
 
 app.get('/api/menu', (req, res) => {
@@ -758,7 +766,7 @@ app.get('/api/queue', (req, res) => {
   res.json({ inQueue: q.inQueue, waitMinutes: Math.max(0, Math.ceil((q.busyUntil - now) / 60000)) });
 });
 app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
   if (!name || !category || price === undefined) {
     return res.status(400).json({ error: "Nama, kategori, dan harga harus diisi" });
   }
@@ -772,6 +780,7 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) 
     imageUrl: imageUrl || "",
     isAvailable: isAvailable !== undefined ? isAvailable : true,
     isBestSeller: isBestSeller === true,
+    dailyStock: parseDailyStock(dailyStock) ?? null,
     createdAt: new Date().toISOString(),
     variants: Array.isArray(variants) && variants.length ? variants : undefined
   };
@@ -784,7 +793,8 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) 
 
 app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
   const { id } = req.params;
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, variants } = req.body;
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
+  const stockValue = parseDailyStock(dailyStock);
 
   const itemIndex = dbState.menu.findIndex(m => m.id === id);
 
@@ -795,8 +805,8 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
   const user = (req as any).user as JwtPayload;
   if (user.role !== 'owner') {
     const current = dbState.menu[itemIndex];
-    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller };
-    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller };
+    const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller, dailyStock: current.dailyStock ?? null };
+    const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller, dailyStock: stockValue };
     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
       return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
     }
@@ -811,6 +821,7 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
     imageUrl: imageUrl !== undefined ? imageUrl : dbState.menu[itemIndex].imageUrl,
     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
     isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
+    dailyStock: stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null),
     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
   };
 
@@ -1047,6 +1058,11 @@ app.post('/api/orders', (req, res) => {
     return { menuId: m.id, name, price, quantity: Number(ni.quantity) || 1, notes: ni.notes || '', variant };
   });
 
+  const short = findStockShortage(orderItems, dbState.menu, computeStockUsed(dbState.orders));
+  if (short) {
+    return res.status(409).json({ error: stockMessage(short.name, short.remaining) });
+  }
+
   const newOrder: Order = {
     id,
     customerName,
@@ -1209,6 +1225,17 @@ app.put('/api/orders/:id/items/:menuId/uncancel', authMiddleware, requireRole('o
   const itemIndex = order.items.findIndex(i => i.menuId === menuId && (i.variant || '') === (variant || '') && i.isCancelled);
   if (itemIndex === -1) {
     return res.status(404).json({ error: "Item tidak ditemukan atau tidak dibatalkan" });
+  }
+
+  if (order.status !== 'dibatalkan') {
+    const restoreShort = findStockShortage(
+      [{ menuId: order.items[itemIndex].menuId, quantity: order.items[itemIndex].quantity }],
+      dbState.menu,
+      computeStockUsed(dbState.orders)
+    );
+    if (restoreShort) {
+      return res.status(409).json({ error: stockMessage(restoreShort.name, restoreShort.remaining) });
+    }
   }
 
   order.items[itemIndex] = {
@@ -1377,6 +1404,11 @@ app.post('/api/orders/:id/items', (req, res) => {
       price = first.price;
     }
     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
+  }
+
+  const addShort = findStockShortage(itemsToAdd, dbState.menu, computeStockUsed(dbState.orders));
+  if (addShort) {
+    return res.status(409).json({ error: stockMessage(addShort.name, addShort.remaining) });
   }
 
   order.items.push(...itemsToAdd);
