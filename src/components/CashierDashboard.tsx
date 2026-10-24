@@ -5,6 +5,7 @@ import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, U
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
 import { computeQueue, getOrderEta, formatClock } from '../utils/estimate';
+import { effectiveStockLimit, stockBonusToday } from '../utils/stock';
 
 interface CashierDashboardProps {
   settings: CafeSettings;
@@ -108,10 +109,66 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch menu for stock management
+  // Fetch menu for stock management (disegarkan berkala agar "Sisa" stok ikut berubah saat ada pesanan)
+  const refreshMenu = () =>
+    fetch('/api/menu').then(res => (res.ok ? res.json() : null)).then(data => { if (data) setMenuItems(data); }).catch(() => {});
   useEffect(() => {
-    fetch('/api/menu').then(res => res.ok && res.json()).then(data => data && setMenuItems(data)).catch(() => {});
+    refreshMenu();
+    const t = setInterval(refreshMenu, 20000);
+    return () => clearInterval(t);
   }, []);
+
+  // Stok darurat khusus hari ini (batas harian tetap diatur owner)
+  const [stockEditItem, setStockEditItem] = useState<MenuItem | null>(null);
+  const [bonusInput, setBonusInput] = useState('');
+  const [stockSaving, setStockSaving] = useState(false);
+  const [stockError, setStockError] = useState('');
+
+  const openStockEditor = (item: MenuItem) => {
+    setStockEditItem(item);
+    // Ada batas harian: total stok darurat hari ini. Tanpa batas harian: sisa porsi darurat saat ini.
+    setBonusInput(
+      item.dailyStock != null
+        ? String(stockBonusToday(item))
+        : (stockBonusToday(item) > 0 ? String(item.stockRemaining ?? 0) : '')
+    );
+    setStockError('');
+    refreshMenu();
+  };
+
+  const putStock = async (payload: Record<string, unknown>) => {
+    if (!stockEditItem) return;
+    setStockSaving(true);
+    setStockError('');
+    try {
+      const res = await fetch(`/api/menu/${stockEditItem.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Gagal menyimpan stok');
+      }
+      await refreshMenu(); // ambil sisa stok terbaru dari server
+      setStockEditItem(null);
+    } catch (e) {
+      setStockError((e as Error).message || 'Gagal menyimpan stok');
+    } finally {
+      setStockSaving(false);
+    }
+  };
+
+  // Tambahan stok darurat hari ini (hangus otomatis besok)
+  const saveBonus = () => {
+    const raw = bonusInput.trim();
+    const value = raw === '' ? 0 : Math.floor(Number(raw));
+    if (!Number.isFinite(value) || value < 0) {
+      setStockError('Masukkan angka 0 atau lebih.');
+      return;
+    }
+    putStock({ stockBonus: value });
+  };
 
   const handleToggleAvailability = async (item: MenuItem, value?: boolean) => {
     try {
@@ -624,12 +681,25 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
                                 {({ makanan: 'Food Menu', kudapan: 'Kudapan', dessert: 'Dessert', minuman: 'Minuman' } as any)[item.category] || item.category}
                               </span>
                               <span className="text-xs font-extrabold text-brand-forest">{formatPrice(item.price)}</span>
-                              {item.dailyStock != null && (
-                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
-                                  Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
+                              {effectiveStockLimit(item) !== null && (
+                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? effectiveStockLimit(item) ?? 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+                                  Sisa {item.stockRemaining ?? effectiveStockLimit(item)}/{effectiveStockLimit(item)}
                                 </span>
                               )}
                             </div>
+                            <button
+                              onClick={() => openStockEditor(item)}
+                              className="mt-2.5 w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-sky-50 border border-slate-200 hover:border-sky-300 text-[10px] font-bold uppercase tracking-wider text-slate-600 hover:text-sky-700 transition-all cursor-pointer"
+                            >
+                              <span>Stok darurat</span>
+                              <span className="normal-case tracking-normal">
+                                {stockBonusToday(item) > 0
+                                  ? (item.dailyStock != null
+                                      ? `+${stockBonusToday(item)} hari ini • Atur`
+                                      : `Sisa ${item.stockRemaining ?? stockBonusToday(item)} hari ini • Atur`)
+                                  : 'Tambah hari ini'}
+                              </span>
+                            </button>
                           </div>
                           {item.variants && item.variants.length > 0 ? (
                             <div className="mt-3 space-y-2">
@@ -931,6 +1001,121 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
           <p className="text-center text-[10px] text-slate-400 pt-2">© {new Date().getFullYear()} {settings.name} — Semua hak cipta dilindungi.</p>
         </main>
       </div>
+
+      {/* STOK DARURAT HARI INI POPUP */}
+      <AnimatePresence>
+        {stockEditItem && (() => {
+          const live = menuItems.find(m => m.id === stockEditItem.id) || stockEditItem;
+          const hasDailyLimit = live.dailyStock != null;
+          const limit = effectiveStockLimit(live);
+          const bonus = stockBonusToday(live);
+          const remaining = limit !== null ? (live.stockRemaining ?? limit) : null;
+          const used = limit !== null && remaining !== null ? Math.max(0, limit - remaining) : null;
+          const chipCls = 'px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-sky-100 border border-slate-200 text-[11px] font-bold text-slate-600 hover:text-sky-700 cursor-pointer';
+          return (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => !stockSaving && setStockEditItem(null)}>
+              <motion.div
+                initial={{ scale: 0.95, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.95, opacity: 0 }}
+                onClick={(e) => e.stopPropagation()}
+                className="bg-white rounded-2xl w-full max-w-sm overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]"
+              >
+                <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Stok Darurat Hari Ini</p>
+                    <p className="font-bold text-slate-800 text-sm truncate">{live.name}</p>
+                  </div>
+                  <button
+                    onClick={() => setStockEditItem(null)}
+                    disabled={stockSaving}
+                    className="p-1 bg-white hover:bg-slate-200 rounded-full border border-slate-200 cursor-pointer flex-shrink-0"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+
+                <div className="p-4 space-y-3 overflow-y-auto">
+                  <div className="bg-brand-badge-bg/50 border border-brand-badge-border rounded-xl p-3 text-xs space-y-1">
+                    {limit !== null ? (
+                      <>
+                        {hasDailyLimit && (
+                          <div className="flex justify-between"><span className="text-slate-500 font-bold">Batas harian (diatur owner)</span><span className="font-extrabold text-slate-800">{live.dailyStock} porsi</span></div>
+                        )}
+                        {bonus > 0 && (
+                          <div className="flex justify-between"><span className="text-slate-500 font-bold">Stok darurat hari ini</span><span className="font-extrabold text-sky-700">+{bonus}</span></div>
+                        )}
+                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Batas hari ini</span><span className="font-extrabold text-slate-800">{limit}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Terpakai hari ini</span><span className="font-extrabold text-slate-800">{used}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Sisa</span><span className="font-extrabold text-brand-deep">{remaining}</span></div>
+                      </>
+                    ) : (
+                      <p className="font-bold text-slate-600">Menu ini tidak punya batas harian (stok tidak terbatas).</p>
+                    )}
+                  </div>
+
+                  {!live.isAvailable && (
+                    <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 font-semibold">
+                      Menu ini sedang ditandai Habis. Tekan "Tersedia" di kartu menu agar bisa dipesan.
+                    </p>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <label htmlFor="cashierStockBonus" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      {hasDailyLimit ? 'Total stok darurat hari ini (porsi)' : 'Stok darurat hari ini (porsi)'}
+                    </label>
+                    <input
+                      id="cashierStockBonus"
+                      type="number"
+                      min="0"
+                      inputMode="numeric"
+                      autoFocus
+                      value={bonusInput}
+                      onChange={(e) => setBonusInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') saveBonus(); }}
+                      placeholder="Jumlah porsi"
+                      className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500 text-slate-800 text-sm"
+                    />
+                    <div className="flex gap-1.5 flex-wrap">
+                      {[5, 10, 20].map(n => (
+                        <button key={n} type="button" onClick={() => setBonusInput(String((Number(bonusInput) || 0) + n))} className={chipCls}>+{n}</button>
+                      ))}
+                      <button type="button" onClick={() => setBonusInput('0')} className={chipCls}>
+                        {hasDailyLimit ? 'Hapus tambahan' : 'Kembali tidak terbatas'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {stockError && <p className="text-[11px] text-red-500 font-semibold">{stockError}</p>}
+
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    {hasDailyLimit
+                      ? 'Ditambahkan ke batas harian, hanya berlaku hari ini. Besok stok kembali ke batas harian yang diatur owner (00.00 WIB).'
+                      : 'Menu ini tidak punya batas harian. Dengan stok darurat, menu hanya tersedia sebanyak jumlah ini mulai sekarang dan berkurang tiap ada pesanan. Besok kembali tidak terbatas (00.00 WIB).'}
+                  </p>
+                </div>
+
+                <div className="p-3 bg-slate-50 border-t border-slate-100 flex gap-2">
+                  <button
+                    onClick={() => setStockEditItem(null)}
+                    disabled={stockSaving}
+                    className="flex-1 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 font-bold py-2.5 rounded-lg text-xs cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    onClick={saveBonus}
+                    disabled={stockSaving}
+                    className="flex-1 bg-sky-600 hover:bg-sky-700 disabled:bg-slate-300 text-white font-bold py-2.5 rounded-lg text-xs cursor-pointer shadow-sm"
+                  >
+                    {stockSaving ? 'Menyimpan...' : 'Simpan'}
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          );
+        })()}
+      </AnimatePresence>
 
       {/* BUKTI BAYAR QRIS POPUP */}
       <AnimatePresence>

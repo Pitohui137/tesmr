@@ -1,0 +1,591 @@
+diff --git a/server.ts b/server.ts
+index 147ce74..86b4e98 100644
+--- a/server.ts
++++ b/server.ts
+@@ -7,7 +7,7 @@ import { LOYALTY_DEFAULTS, LoyaltyStatus, Voucher, computeOrderTotals, loyaltyPr
+ import { MENUS } from './server/menu-data';
+ import { computeQueue, getOrderEta } from './src/utils/estimate';
+ import { computeAutoBestSellers } from './src/utils/bestseller';
+-import { computeStockUsed, findStockShortage, parseDailyStock, stockMessage, stockRemainingOf } from './src/utils/stock';
++import { computeStockUsed, effectiveStockLimit, findStockShortage, parseDailyStock, parseStockBonus, stockBonusToday, stockMessage, stockRemainingOf, todayKey as stockTodayKey } from './src/utils/stock';
+ import Database from 'better-sqlite3';
+ import bcrypt from 'bcryptjs';
+ import jwt from 'jsonwebtoken';
+@@ -756,9 +756,9 @@ function menuForClients() {
+     const ids = bestSellerCache.ids;
+     list = list.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+   }
+-  if (list.some(m => m.dailyStock != null)) {
++  if (list.some(m => effectiveStockLimit(m) !== null)) {
+     const used = computeStockUsed(dbState.orders);
+-    list = list.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: stockRemainingOf(m.dailyStock, used[m.id] || 0) }));
++    list = list.map(m => (effectiveStockLimit(m) === null ? m : { ...m, stockRemaining: stockRemainingOf(effectiveStockLimit(m), used[m.id] || 0) }));
+   }
+   return list;
+ }
+@@ -801,8 +801,9 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res)
+ 
+ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
+   const { id } = req.params;
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, stockBonus, variants } = req.body;
+   const stockValue = parseDailyStock(dailyStock);
++  const bonusValue = parseStockBonus(stockBonus);
+ 
+   const itemIndex = dbState.menu.findIndex(m => m.id === id);
+ 
+@@ -816,10 +817,17 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+     const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller, dailyStock: current.dailyStock ?? null };
+     const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller, dailyStock: stockValue };
+     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
+-      return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
++      return res.status(403).json({ error: 'Kasir hanya bisa mengubah ketersediaan menu dan menambah stok darurat hari ini' });
+     }
+   }
+ 
++  const previousBonus = stockBonusToday(dbState.menu[itemIndex]);
++  // Menu tanpa batas harian: stok darurat dihitung "mulai sekarang", jadi catat jumlah terjual saat ini
++  let bonusBase = 0;
++  if (bonusValue !== undefined && bonusValue > 0) {
++    const dailyAfter = stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null);
++    if (dailyAfter === null) bonusBase = computeStockUsed(dbState.orders)[id] || 0;
++  }
+   dbState.menu[itemIndex] = {
+     ...dbState.menu[itemIndex],
+     name: name || dbState.menu[itemIndex].name,
+@@ -830,9 +838,16 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
+     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
+     isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
+     dailyStock: stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null),
++    stockBonus: bonusValue !== undefined ? bonusValue : dbState.menu[itemIndex].stockBonus,
++    stockBonusDate: bonusValue !== undefined ? stockTodayKey() : dbState.menu[itemIndex].stockBonusDate,
++    stockBonusBase: bonusValue !== undefined ? bonusBase : dbState.menu[itemIndex].stockBonusBase,
+     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
+   };
+ 
++  if (bonusValue !== undefined && previousBonus !== bonusValue) {
++    const actor = ((req as any).user as JwtPayload)?.username || 'staff';
++    logApp('INFO', `Stok darurat hari ini ${dbState.menu[itemIndex].name}: +${previousBonus} -> +${bonusValue} (oleh ${actor})`, { menuId: id, from: previousBonus, to: bonusValue, by: actor });
++  }
+   saveDB();
+   notifyClientsRefresh();
+   res.json({ message: "Menu berhasil diperbarui", item: dbState.menu[itemIndex] });
+diff --git a/server/migrate-stock-bonus.sql b/server/migrate-stock-bonus.sql
+new file mode 100644
+index 0000000..b3c801b
+--- /dev/null
++++ b/server/migrate-stock-bonus.sql
+@@ -0,0 +1,10 @@
++-- Migrasi: stok darurat khusus hari ini (hangus otomatis saat pergantian hari)
++-- Jalankan (lokal):  npx wrangler d1 execute mepetrumah-db --local --file=server/migrate-stock-bonus.sql
++-- Jalankan (remote): npx wrangler d1 execute mepetrumah-db --remote --file=server/migrate-stock-bonus.sql
++-- Jalankan SEKALI pada database yang sudah ada, SEBELUM deploy kode baru.
++-- Jika berhenti dengan "duplicate column name: ...", hapus baris ALTER yang sudah pernah dijalankan
++-- (mis. stock_bonus dan stock_bonus_date) lalu jalankan ulang sisanya.
++
++ALTER TABLE menu ADD COLUMN stock_bonus INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE menu ADD COLUMN stock_bonus_date TEXT;
++ALTER TABLE menu ADD COLUMN stock_bonus_base INTEGER NOT NULL DEFAULT 0;
+diff --git a/server/schema.sql b/server/schema.sql
+index 7a15809..8b5b30f 100644
+--- a/server/schema.sql
++++ b/server/schema.sql
+@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS menu (
+   is_available INTEGER NOT NULL DEFAULT 1,
+   is_best_seller INTEGER NOT NULL DEFAULT 0,
+   daily_stock INTEGER,
++  stock_bonus INTEGER NOT NULL DEFAULT 0,
++  stock_bonus_date TEXT,
++  stock_bonus_base INTEGER NOT NULL DEFAULT 0,
+   variants TEXT NOT NULL DEFAULT '',
+   created_at TEXT NOT NULL
+ );
+diff --git a/server/worker.ts b/server/worker.ts
+index 730afc6..2101ce5 100644
+--- a/server/worker.ts
++++ b/server/worker.ts
+@@ -3,7 +3,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+ import { SignJWT, jwtVerify } from 'jose';
+ import { computeQueue, getOrderEta } from '../src/utils/estimate';
+ import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
+-import { computeStockUsed, dayStartMs, findStockShortage, parseDailyStock, stockMessage } from '../src/utils/stock';
++import { computeStockUsed, dayStartMs, effectiveStockLimit, findStockShortage, parseDailyStock, parseStockBonus, stockMessage, todayKey } from '../src/utils/stock';
+ import { LOYALTY_DEFAULTS, computeOrderTotals, loyaltyProgress, maskPhone, normalizePhone, sanitizeLoyaltyConfig } from '../src/utils/loyalty';
+ 
+ // ====== Minimal D1 / Workers types ======
+@@ -70,6 +70,9 @@ interface MenuRow {
+   is_available: number;
+   is_best_seller?: number;
+   daily_stock?: number | null;
++  stock_bonus?: number;
++  stock_bonus_date?: string | null;
++  stock_bonus_base?: number;
+   variants: string;
+   created_at: string;
+ }
+@@ -257,6 +260,9 @@ function toMenu(m: MenuRow) {
+     isAvailable: !!m.is_available,
+     isBestSeller: !!m.is_best_seller,
+     dailyStock: m.daily_stock ?? null,
++    stockBonus: m.stock_bonus || 0,
++    stockBonusDate: m.stock_bonus_date || undefined,
++    stockBonusBase: m.stock_bonus_base || 0,
+     createdAt: m.created_at,
+     variants: variants && variants.length ? variants : undefined,
+   };
+@@ -383,9 +389,12 @@ async function getMenuForClients(db: D1Database): Promise<any[]> {
+     const ids = await getBestSellerIds(db, menu);
+     menu = menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
+   }
+-  if (menu.some(m => m.dailyStock != null)) {
++  if (menu.some(m => effectiveStockLimit(m) !== null)) {
+     const used = await getStockUsedCached(db);
+-    menu = menu.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: Math.max(0, m.dailyStock - (used[m.id] || 0)) }));
++    menu = menu.map(m => {
++      const limit = effectiveStockLimit(m);
++      return limit === null ? m : { ...m, stockRemaining: Math.max(0, limit - (used[m.id] || 0)) };
++    });
+   }
+   return menu;
+ }
+@@ -780,20 +789,28 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
+ app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
+   const { id } = c.req.param();
+   const user = c.get('user') as { role: Role };
+-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
++  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, stockBonus, variants } = await c.req.json().catch(() => ({}));
+   const stockValue = parseDailyStock(dailyStock);
++  const bonusValue = parseStockBonus(stockBonus);
+ 
+   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
+ 
+   if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined || stockValue !== undefined)) {
+-    return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
++    return c.json({ error: 'Kasir hanya bisa mengubah ketersediaan menu dan menambah stok darurat hari ini' }, 403);
++  }
++
++  // Menu tanpa batas harian: stok darurat dihitung "mulai sekarang", jadi catat jumlah terjual saat ini
++  let bonusBase = 0;
++  if (bonusValue !== undefined && bonusValue > 0) {
++    const dailyAfter = stockValue !== undefined ? stockValue : (current.daily_stock ?? null);
++    if (dailyAfter === null) bonusBase = (await getStockUsed(c.env.DB))[id] || 0;
+   }
+ 
+   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
+   await c.env.DB.prepare(
+     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
+-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, variants = COALESCE(?, variants) WHERE id = ?'
++    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, stock_bonus = CASE WHEN ? = 1 THEN ? ELSE stock_bonus END, stock_bonus_date = CASE WHEN ? = 1 THEN ? ELSE stock_bonus_date END, stock_bonus_base = CASE WHEN ? = 1 THEN ? ELSE stock_bonus_base END, variants = COALESCE(?, variants) WHERE id = ?'
+   ).bind(
+     name ?? null, category ?? null,
+     price !== undefined ? Number(price) : null,
+@@ -801,10 +818,21 @@ app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
+     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
+     isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
+     stockValue !== undefined ? 1 : 0, stockValue ?? null,
++    bonusValue !== undefined ? 1 : 0, bonusValue ?? 0,
++    bonusValue !== undefined ? 1 : 0, todayKey(),
++    bonusValue !== undefined ? 1 : 0, bonusBase,
+     variantsStr ?? null, id
+   ).run();
+   invalidateMenuCache();
+ 
++  if (bonusValue !== undefined) {
++    const before = current.stock_bonus_date === todayKey() ? (current.stock_bonus || 0) : 0;
++    if (before !== bonusValue) {
++      const actor = (c.get('user') as { username?: string })?.username || 'staff';
++      await logApp(c, 'INFO', `Stok darurat hari ini ${current.name}: +${before} -> +${bonusValue} (oleh ${actor})`, { menuId: id, from: before, to: bonusValue, by: actor });
++    }
++  }
++
+   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
+   return c.json({ message: 'Menu berhasil diperbarui', item: toMenu(row!) });
+ });
+@@ -952,7 +980,7 @@ app.post('/api/orders', async (c) => {
+   });
+ 
+   // Stok harian: tolak jika melebihi sisa stok
+-  const stockLimited = normItems.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null);
++  const stockLimited = normItems.some((i: any) => { const m = menuRows.find((x: any) => x.id === i.menuId); return !!m && effectiveStockLimit(m) !== null; });
+   if (stockLimited) {
+     const short = findStockShortage(normItems, menuRows, await getStockUsed(c.env.DB));
+     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
+@@ -996,13 +1024,13 @@ app.post('/api/orders', async (c) => {
+   if (stockLimited) {
+     // Cek ulang setelah insert: bila dua pesanan masuk bersamaan dan stok terlampaui, batalkan yang terakhir
+     const after = await getStockUsed(c.env.DB);
+-    const over = menuRows.find((m: any) => m.dailyStock != null && normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > m.dailyStock);
++    const over = menuRows.find((m: any) => normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > (effectiveStockLimit(m) ?? Infinity));
+     if (over) {
+       await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
+       if (useVoucher) await restoreVoucher(c.env.DB, { id, voucher_id: voucher!.id } as OrderRow);
+       invalidateOrdersCache();
+       const own = normItems.filter((i: any) => i.menuId === over.id).reduce((s: number, i: any) => s + i.quantity, 0);
+-      return c.json({ error: stockMessage(over.name, Math.max(0, over.dailyStock - ((after[over.id] || 0) - own))) }, 409);
++      return c.json({ error: stockMessage(over.name, Math.max(0, (effectiveStockLimit(over) ?? 0) - ((after[over.id] || 0) - own))) }, 409);
+     }
+   }
+   await trackOrder(c);
+@@ -1226,7 +1254,7 @@ app.post('/api/orders/:id/items', async (c) => {
+     }
+     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
+   }
+-  if (itemsToAdd.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null)) {
++  if (itemsToAdd.some((i: any) => { const m = menuRows.find((x: any) => x.id === i.menuId); return !!m && effectiveStockLimit(m) !== null; })) {
+     const short = findStockShortage(itemsToAdd, menuRows, await getStockUsed(c.env.DB));
+     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
+   }
+diff --git a/src/components/CashierDashboard.tsx b/src/components/CashierDashboard.tsx
+index 2935edd..d8cef81 100644
+--- a/src/components/CashierDashboard.tsx
++++ b/src/components/CashierDashboard.tsx
+@@ -5,6 +5,7 @@ import { Play, ClipboardCheck, ArrowUpRight, CheckCircle, Clock, ShoppingCart, U
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
+ import { computeQueue, getOrderEta, formatClock } from '../utils/estimate';
++import { effectiveStockLimit, stockBonusToday } from '../utils/stock';
+ 
+ interface CashierDashboardProps {
+   settings: CafeSettings;
+@@ -108,11 +109,67 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+     return () => clearInterval(interval);
+   }, []);
+ 
+-  // Fetch menu for stock management
++  // Fetch menu for stock management (disegarkan berkala agar "Sisa" stok ikut berubah saat ada pesanan)
++  const refreshMenu = () =>
++    fetch('/api/menu').then(res => (res.ok ? res.json() : null)).then(data => { if (data) setMenuItems(data); }).catch(() => {});
+   useEffect(() => {
+-    fetch('/api/menu').then(res => res.ok && res.json()).then(data => data && setMenuItems(data)).catch(() => {});
++    refreshMenu();
++    const t = setInterval(refreshMenu, 20000);
++    return () => clearInterval(t);
+   }, []);
+ 
++  // Stok darurat khusus hari ini (batas harian tetap diatur owner)
++  const [stockEditItem, setStockEditItem] = useState<MenuItem | null>(null);
++  const [bonusInput, setBonusInput] = useState('');
++  const [stockSaving, setStockSaving] = useState(false);
++  const [stockError, setStockError] = useState('');
++
++  const openStockEditor = (item: MenuItem) => {
++    setStockEditItem(item);
++    // Ada batas harian: total stok darurat hari ini. Tanpa batas harian: sisa porsi darurat saat ini.
++    setBonusInput(
++      item.dailyStock != null
++        ? String(stockBonusToday(item))
++        : (stockBonusToday(item) > 0 ? String(item.stockRemaining ?? 0) : '')
++    );
++    setStockError('');
++    refreshMenu();
++  };
++
++  const putStock = async (payload: Record<string, unknown>) => {
++    if (!stockEditItem) return;
++    setStockSaving(true);
++    setStockError('');
++    try {
++      const res = await fetch(`/api/menu/${stockEditItem.id}`, {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(payload)
++      });
++      if (!res.ok) {
++        const data = await res.json().catch(() => ({}));
++        throw new Error(data.error || 'Gagal menyimpan stok');
++      }
++      await refreshMenu(); // ambil sisa stok terbaru dari server
++      setStockEditItem(null);
++    } catch (e) {
++      setStockError((e as Error).message || 'Gagal menyimpan stok');
++    } finally {
++      setStockSaving(false);
++    }
++  };
++
++  // Tambahan stok darurat hari ini (hangus otomatis besok)
++  const saveBonus = () => {
++    const raw = bonusInput.trim();
++    const value = raw === '' ? 0 : Math.floor(Number(raw));
++    if (!Number.isFinite(value) || value < 0) {
++      setStockError('Masukkan angka 0 atau lebih.');
++      return;
++    }
++    putStock({ stockBonus: value });
++  };
++
+   const handleToggleAvailability = async (item: MenuItem, value?: boolean) => {
+     try {
+       const res = await fetch(`/api/menu/${item.id}`, {
+@@ -624,12 +681,25 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+                                 {({ makanan: 'Food Menu', kudapan: 'Kudapan', dessert: 'Dessert', minuman: 'Minuman' } as any)[item.category] || item.category}
+                               </span>
+                               <span className="text-xs font-extrabold text-brand-forest">{formatPrice(item.price)}</span>
+-                              {item.dailyStock != null && (
+-                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+-                                  Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
++                              {effectiveStockLimit(item) !== null && (
++                                <span className={`text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded-md ${(item.stockRemaining ?? effectiveStockLimit(item) ?? 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
++                                  Sisa {item.stockRemaining ?? effectiveStockLimit(item)}/{effectiveStockLimit(item)}
+                                 </span>
+                               )}
+                             </div>
++                            <button
++                              onClick={() => openStockEditor(item)}
++                              className="mt-2.5 w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-sky-50 border border-slate-200 hover:border-sky-300 text-[10px] font-bold uppercase tracking-wider text-slate-600 hover:text-sky-700 transition-all cursor-pointer"
++                            >
++                              <span>Stok darurat</span>
++                              <span className="normal-case tracking-normal">
++                                {stockBonusToday(item) > 0
++                                  ? (item.dailyStock != null
++                                      ? `+${stockBonusToday(item)} hari ini • Atur`
++                                      : `Sisa ${item.stockRemaining ?? stockBonusToday(item)} hari ini • Atur`)
++                                  : 'Tambah hari ini'}
++                              </span>
++                            </button>
+                           </div>
+                           {item.variants && item.variants.length > 0 ? (
+                             <div className="mt-3 space-y-2">
+@@ -932,6 +1002,121 @@ export default function CashierDashboard({ settings, onLogout, user }: CashierDa
+         </main>
+       </div>
+ 
++      {/* STOK DARURAT HARI INI POPUP */}
++      <AnimatePresence>
++        {stockEditItem && (() => {
++          const live = menuItems.find(m => m.id === stockEditItem.id) || stockEditItem;
++          const hasDailyLimit = live.dailyStock != null;
++          const limit = effectiveStockLimit(live);
++          const bonus = stockBonusToday(live);
++          const remaining = limit !== null ? (live.stockRemaining ?? limit) : null;
++          const used = limit !== null && remaining !== null ? Math.max(0, limit - remaining) : null;
++          const chipCls = 'px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-sky-100 border border-slate-200 text-[11px] font-bold text-slate-600 hover:text-sky-700 cursor-pointer';
++          return (
++            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => !stockSaving && setStockEditItem(null)}>
++              <motion.div
++                initial={{ scale: 0.95, opacity: 0 }}
++                animate={{ scale: 1, opacity: 1 }}
++                exit={{ scale: 0.95, opacity: 0 }}
++                onClick={(e) => e.stopPropagation()}
++                className="bg-white rounded-2xl w-full max-w-sm overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]"
++              >
++                <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-center gap-3">
++                  <div className="min-w-0">
++                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Stok Darurat Hari Ini</p>
++                    <p className="font-bold text-slate-800 text-sm truncate">{live.name}</p>
++                  </div>
++                  <button
++                    onClick={() => setStockEditItem(null)}
++                    disabled={stockSaving}
++                    className="p-1 bg-white hover:bg-slate-200 rounded-full border border-slate-200 cursor-pointer flex-shrink-0"
++                  >
++                    <X size={14} />
++                  </button>
++                </div>
++
++                <div className="p-4 space-y-3 overflow-y-auto">
++                  <div className="bg-brand-badge-bg/50 border border-brand-badge-border rounded-xl p-3 text-xs space-y-1">
++                    {limit !== null ? (
++                      <>
++                        {hasDailyLimit && (
++                          <div className="flex justify-between"><span className="text-slate-500 font-bold">Batas harian (diatur owner)</span><span className="font-extrabold text-slate-800">{live.dailyStock} porsi</span></div>
++                        )}
++                        {bonus > 0 && (
++                          <div className="flex justify-between"><span className="text-slate-500 font-bold">Stok darurat hari ini</span><span className="font-extrabold text-sky-700">+{bonus}</span></div>
++                        )}
++                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Batas hari ini</span><span className="font-extrabold text-slate-800">{limit}</span></div>
++                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Terpakai hari ini</span><span className="font-extrabold text-slate-800">{used}</span></div>
++                        <div className="flex justify-between"><span className="text-slate-500 font-bold">Sisa</span><span className="font-extrabold text-brand-deep">{remaining}</span></div>
++                      </>
++                    ) : (
++                      <p className="font-bold text-slate-600">Menu ini tidak punya batas harian (stok tidak terbatas).</p>
++                    )}
++                  </div>
++
++                  {!live.isAvailable && (
++                    <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 font-semibold">
++                      Menu ini sedang ditandai Habis. Tekan "Tersedia" di kartu menu agar bisa dipesan.
++                    </p>
++                  )}
++
++                  <div className="space-y-1.5">
++                    <label htmlFor="cashierStockBonus" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
++                      {hasDailyLimit ? 'Total stok darurat hari ini (porsi)' : 'Stok darurat hari ini (porsi)'}
++                    </label>
++                    <input
++                      id="cashierStockBonus"
++                      type="number"
++                      min="0"
++                      inputMode="numeric"
++                      autoFocus
++                      value={bonusInput}
++                      onChange={(e) => setBonusInput(e.target.value)}
++                      onKeyDown={(e) => { if (e.key === 'Enter') saveBonus(); }}
++                      placeholder="Jumlah porsi"
++                      className="w-full px-4 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500 text-slate-800 text-sm"
++                    />
++                    <div className="flex gap-1.5 flex-wrap">
++                      {[5, 10, 20].map(n => (
++                        <button key={n} type="button" onClick={() => setBonusInput(String((Number(bonusInput) || 0) + n))} className={chipCls}>+{n}</button>
++                      ))}
++                      <button type="button" onClick={() => setBonusInput('0')} className={chipCls}>
++                        {hasDailyLimit ? 'Hapus tambahan' : 'Kembali tidak terbatas'}
++                      </button>
++                    </div>
++                  </div>
++
++                  {stockError && <p className="text-[11px] text-red-500 font-semibold">{stockError}</p>}
++
++                  <p className="text-[10px] text-slate-400 leading-snug">
++                    {hasDailyLimit
++                      ? 'Ditambahkan ke batas harian, hanya berlaku hari ini. Besok stok kembali ke batas harian yang diatur owner (00.00 WIB).'
++                      : 'Menu ini tidak punya batas harian. Dengan stok darurat, menu hanya tersedia sebanyak jumlah ini mulai sekarang dan berkurang tiap ada pesanan. Besok kembali tidak terbatas (00.00 WIB).'}
++                  </p>
++                </div>
++
++                <div className="p-3 bg-slate-50 border-t border-slate-100 flex gap-2">
++                  <button
++                    onClick={() => setStockEditItem(null)}
++                    disabled={stockSaving}
++                    className="flex-1 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 font-bold py-2.5 rounded-lg text-xs cursor-pointer"
++                  >
++                    Batal
++                  </button>
++                  <button
++                    onClick={saveBonus}
++                    disabled={stockSaving}
++                    className="flex-1 bg-sky-600 hover:bg-sky-700 disabled:bg-slate-300 text-white font-bold py-2.5 rounded-lg text-xs cursor-pointer shadow-sm"
++                  >
++                    {stockSaving ? 'Menyimpan...' : 'Simpan'}
++                  </button>
++                </div>
++              </motion.div>
++            </div>
++          );
++        })()}
++      </AnimatePresence>
++
+       {/* BUKTI BAYAR QRIS POPUP */}
+       <AnimatePresence>
+         {proofOrder && (() => {
+diff --git a/src/components/OwnerDashboard.tsx b/src/components/OwnerDashboard.tsx
+index b577518..1d1595a 100644
+--- a/src/components/OwnerDashboard.tsx
++++ b/src/components/OwnerDashboard.tsx
+@@ -8,6 +8,7 @@ import {
+ } from 'lucide-react';
+ import { motion, AnimatePresence } from 'motion/react';
+ import { apiFetch } from '../utils/api';
++import { effectiveStockLimit, stockBonusToday } from '../utils/stock';
+ import { compressImage } from '../utils/image';
+ import { LOYALTY_DEFAULTS } from '../utils/loyalty';
+ 
+@@ -981,9 +982,9 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
+                               <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
+                             </span>
+                           )}
+-                          {item.dailyStock != null && (
+-                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+-                              Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
++                          {effectiveStockLimit(item) !== null && (
++                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? effectiveStockLimit(item) ?? 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
++                              Sisa {item.stockRemaining ?? effectiveStockLimit(item)}/{effectiveStockLimit(item)}{stockBonusToday(item) > 0 && ` (+${stockBonusToday(item)} hari ini)`}
+                             </span>
+                           )}
+                         </h4>
+diff --git a/src/types.ts b/src/types.ts
+index 4b85b98..5603fbb 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -31,6 +31,9 @@ export interface MenuItem {
+   isBestSeller?: boolean;
+   isAutoBestSeller?: boolean;
+   dailyStock?: number | null;      // batas porsi per hari (null/kosong = tidak terbatas)
++  stockBonus?: number;             // tambahan stok khusus satu hari
++  stockBonusDate?: string | null;  // tanggal (WIB) tambahan itu berlaku; lewat hari = hangus
++  stockBonusBase?: number;         // menu tanpa batas harian: jumlah terjual saat stok darurat diatur
+   stockRemaining?: number | null;  // sisa stok hari ini (dihitung server)
+   createdAt: string;
+   variants?: MenuVariant[];
+diff --git a/src/utils/stock.ts b/src/utils/stock.ts
+index 791c73e..c28fc8d 100644
+--- a/src/utils/stock.ts
++++ b/src/utils/stock.ts
+@@ -1,4 +1,4 @@
+-// Stok harian per menu.
++// Stok harian per menu (+ tambahan stok khusus hari ini).
+ // Pemakaian stok DIHITUNG dari pesanan hari ini (bukan counter terpisah), sehingga
+ // otomatis kembali saat pesanan/item dibatalkan atau dihapus, dan otomatis reset tiap hari.
+ // Pesanan yang menunggu verifikasi tetap menahan stok sampai dibatalkan kasir.
+@@ -38,6 +38,37 @@ export function computeStockUsed(orders: UsageOrder[], now = Date.now()): Record
+ }
+ 
+ // Sisa stok hari ini; null = tidak dibatasi
++// Tanggal hari ini (YYYY-MM-DD) menurut zona waktu cafe
++export function todayKey(now = Date.now()): string {
++  return new Date(now + STOCK_TZ_OFFSET_HOURS * HOUR).toISOString().slice(0, 10);
++}
++
++interface StockLimitFields {
++  dailyStock?: number | null;
++  stockBonus?: number;
++  stockBonusBase?: number;       // untuk menu tanpa batas harian: jumlah terjual saat stok darurat diatur
++  stockBonusDate?: string | null;
++}
++
++// Tambahan stok yang masih berlaku: hanya jika dicatat HARI INI, otomatis hangus besok
++export function stockBonusToday(m: StockLimitFields, now = Date.now()): number {
++  return m.stockBonusDate === todayKey(now) ? Math.max(0, Number(m.stockBonus) || 0) : 0;
++}
++
++// Batas stok yang berlaku hari ini. null = tidak terbatas.
++// - Ada batas harian: batas harian + stok darurat hari ini.
++// - Tanpa batas harian: tidak terbatas, KECUALI kasir memasang stok darurat. Maka menu hanya tersedia
++//   sebanyak stok darurat itu, dihitung dari saat stok darurat diatur (hangus besok -> kembali tidak terbatas).
++export function effectiveStockLimit(m: StockLimitFields, now = Date.now()): number | null {
++  const bonus = stockBonusToday(m, now);
++  if (m.dailyStock === null || m.dailyStock === undefined) {
++    if (bonus <= 0) return null;
++    const base = m.stockBonusDate === todayKey(now) ? Math.max(0, Number(m.stockBonusBase) || 0) : 0;
++    return base + bonus;
++  }
++  return m.dailyStock + bonus;
++}
++
+ export function stockRemainingOf(dailyStock: number | null | undefined, used: number): number | null {
+   if (dailyStock === null || dailyStock === undefined) return null;
+   return Math.max(0, dailyStock - used);
+@@ -52,15 +83,16 @@ export function stockMessage(name: string, remaining: number): string {
+ // Cek apakah permintaan melebihi stok. Mengembalikan menu pertama yang kurang, atau null jika aman.
+ export function findStockShortage(
+   requested: { menuId: string; quantity: number }[],
+-  menu: { id: string; name: string; dailyStock?: number | null }[],
++  menu: ({ id: string; name: string } & StockLimitFields)[],
+   used: Record<string, number>
+ ): { name: string; remaining: number } | null {
+   const want: Record<string, number> = {};
+   for (const r of requested) want[r.menuId] = (want[r.menuId] || 0) + (Number(r.quantity) || 0);
+   for (const [menuId, qty] of Object.entries(want)) {
+     const m = menu.find(x => x.id === menuId);
+-    if (!m || m.dailyStock === null || m.dailyStock === undefined) continue;
+-    const remaining = Math.max(0, m.dailyStock - (used[menuId] || 0));
++    const limit = m ? effectiveStockLimit(m) : null;
++    if (!m || limit === null) continue;
++    const remaining = Math.max(0, limit - (used[menuId] || 0));
+     if (qty > remaining) return { name: m.name, remaining };
+   }
+   return null;
+@@ -74,3 +106,12 @@ export function parseDailyStock(v: unknown): number | null | undefined {
+   if (!Number.isFinite(n)) return undefined;
+   return Math.max(0, Math.floor(n));
+ }
++
++// Baca tambahan stok dari input: undefined = tidak dikirim, null/'' = 0 (hapus tambahan), angka >= 0
++export function parseStockBonus(v: unknown): number | undefined {
++  if (v === undefined) return undefined;
++  if (v === null || v === '') return 0;
++  const n = Number(v);
++  if (!Number.isFinite(n)) return undefined;
++  return Math.min(100000, Math.max(0, Math.floor(n)));
++}

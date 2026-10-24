@@ -31,6 +31,9 @@ export interface MenuItem {
   isBestSeller?: boolean;
   isAutoBestSeller?: boolean;
   dailyStock?: number | null;      // batas porsi per hari (null/kosong = tidak terbatas)
+  stockBonus?: number;             // tambahan stok khusus satu hari
+  stockBonusDate?: string | null;  // tanggal (WIB) tambahan itu berlaku; lewat hari = hangus
+  stockBonusBase?: number;         // menu tanpa batas harian: jumlah terjual saat stok darurat diatur
   stockRemaining?: number | null;  // sisa stok hari ini (dihitung server)
   createdAt: string;
   variants?: MenuVariant[];

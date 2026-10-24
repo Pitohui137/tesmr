@@ -3,7 +3,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { SignJWT, jwtVerify } from 'jose';
 import { computeQueue, getOrderEta } from '../src/utils/estimate';
 import { computeAutoBestSellers, BEST_SELLER_DAYS } from '../src/utils/bestseller';
-import { computeStockUsed, dayStartMs, findStockShortage, parseDailyStock, stockMessage } from '../src/utils/stock';
+import { computeStockUsed, dayStartMs, effectiveStockLimit, findStockShortage, parseDailyStock, parseStockBonus, stockMessage, todayKey } from '../src/utils/stock';
 import { LOYALTY_DEFAULTS, computeOrderTotals, loyaltyProgress, maskPhone, normalizePhone, sanitizeLoyaltyConfig } from '../src/utils/loyalty';
 
 // ====== Minimal D1 / Workers types ======
@@ -70,6 +70,9 @@ interface MenuRow {
   is_available: number;
   is_best_seller?: number;
   daily_stock?: number | null;
+  stock_bonus?: number;
+  stock_bonus_date?: string | null;
+  stock_bonus_base?: number;
   variants: string;
   created_at: string;
 }
@@ -257,6 +260,9 @@ function toMenu(m: MenuRow) {
     isAvailable: !!m.is_available,
     isBestSeller: !!m.is_best_seller,
     dailyStock: m.daily_stock ?? null,
+    stockBonus: m.stock_bonus || 0,
+    stockBonusDate: m.stock_bonus_date || undefined,
+    stockBonusBase: m.stock_bonus_base || 0,
     createdAt: m.created_at,
     variants: variants && variants.length ? variants : undefined,
   };
@@ -383,9 +389,12 @@ async function getMenuForClients(db: D1Database): Promise<any[]> {
     const ids = await getBestSellerIds(db, menu);
     menu = menu.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
   }
-  if (menu.some(m => m.dailyStock != null)) {
+  if (menu.some(m => effectiveStockLimit(m) !== null)) {
     const used = await getStockUsedCached(db);
-    menu = menu.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: Math.max(0, m.dailyStock - (used[m.id] || 0)) }));
+    menu = menu.map(m => {
+      const limit = effectiveStockLimit(m);
+      return limit === null ? m : { ...m, stockRemaining: Math.max(0, limit - (used[m.id] || 0)) };
+    });
   }
   return menu;
 }
@@ -780,20 +789,28 @@ app.post('/api/menu', auth, requireRole('owner', 'kasir'), async (c) => {
 app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
   const { id } = c.req.param();
   const user = c.get('user') as { role: Role };
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = await c.req.json().catch(() => ({}));
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, stockBonus, variants } = await c.req.json().catch(() => ({}));
   const stockValue = parseDailyStock(dailyStock);
+  const bonusValue = parseStockBonus(stockBonus);
 
   const current = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   if (!current) return c.json({ error: 'Menu tidak ditemukan' }, 404);
 
   if (user.role !== 'owner' && (name !== undefined || category !== undefined || price !== undefined || description !== undefined || imageUrl !== undefined || variants !== undefined || isBestSeller !== undefined || stockValue !== undefined)) {
-    return c.json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' }, 403);
+    return c.json({ error: 'Kasir hanya bisa mengubah ketersediaan menu dan menambah stok darurat hari ini' }, 403);
+  }
+
+  // Menu tanpa batas harian: stok darurat dihitung "mulai sekarang", jadi catat jumlah terjual saat ini
+  let bonusBase = 0;
+  if (bonusValue !== undefined && bonusValue > 0) {
+    const dailyAfter = stockValue !== undefined ? stockValue : (current.daily_stock ?? null);
+    if (dailyAfter === null) bonusBase = (await getStockUsed(c.env.DB))[id] || 0;
   }
 
   const variantsStr = Array.isArray(variants) ? JSON.stringify(variants) : undefined;
   await c.env.DB.prepare(
     'UPDATE menu SET name = COALESCE(?, name), category = COALESCE(?, category), price = COALESCE(?, price), ' +
-    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, variants = COALESCE(?, variants) WHERE id = ?'
+    'description = COALESCE(?, description), image_url = COALESCE(?, image_url), is_available = COALESCE(?, is_available), is_best_seller = COALESCE(?, is_best_seller), daily_stock = CASE WHEN ? = 1 THEN ? ELSE daily_stock END, stock_bonus = CASE WHEN ? = 1 THEN ? ELSE stock_bonus END, stock_bonus_date = CASE WHEN ? = 1 THEN ? ELSE stock_bonus_date END, stock_bonus_base = CASE WHEN ? = 1 THEN ? ELSE stock_bonus_base END, variants = COALESCE(?, variants) WHERE id = ?'
   ).bind(
     name ?? null, category ?? null,
     price !== undefined ? Number(price) : null,
@@ -801,9 +818,20 @@ app.put('/api/menu/:id', auth, requireRole('owner', 'kasir'), async (c) => {
     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
     isBestSeller !== undefined ? (isBestSeller ? 1 : 0) : null,
     stockValue !== undefined ? 1 : 0, stockValue ?? null,
+    bonusValue !== undefined ? 1 : 0, bonusValue ?? 0,
+    bonusValue !== undefined ? 1 : 0, todayKey(),
+    bonusValue !== undefined ? 1 : 0, bonusBase,
     variantsStr ?? null, id
   ).run();
   invalidateMenuCache();
+
+  if (bonusValue !== undefined) {
+    const before = current.stock_bonus_date === todayKey() ? (current.stock_bonus || 0) : 0;
+    if (before !== bonusValue) {
+      const actor = (c.get('user') as { username?: string })?.username || 'staff';
+      await logApp(c, 'INFO', `Stok darurat hari ini ${current.name}: +${before} -> +${bonusValue} (oleh ${actor})`, { menuId: id, from: before, to: bonusValue, by: actor });
+    }
+  }
 
   const row = await c.env.DB.prepare('SELECT * FROM menu WHERE id = ?').bind(id).first<MenuRow>();
   return c.json({ message: 'Menu berhasil diperbarui', item: toMenu(row!) });
@@ -952,7 +980,7 @@ app.post('/api/orders', async (c) => {
   });
 
   // Stok harian: tolak jika melebihi sisa stok
-  const stockLimited = normItems.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null);
+  const stockLimited = normItems.some((i: any) => { const m = menuRows.find((x: any) => x.id === i.menuId); return !!m && effectiveStockLimit(m) !== null; });
   if (stockLimited) {
     const short = findStockShortage(normItems, menuRows, await getStockUsed(c.env.DB));
     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
@@ -996,13 +1024,13 @@ app.post('/api/orders', async (c) => {
   if (stockLimited) {
     // Cek ulang setelah insert: bila dua pesanan masuk bersamaan dan stok terlampaui, batalkan yang terakhir
     const after = await getStockUsed(c.env.DB);
-    const over = menuRows.find((m: any) => m.dailyStock != null && normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > m.dailyStock);
+    const over = menuRows.find((m: any) => normItems.some((i: any) => i.menuId === m.id) && (after[m.id] || 0) > (effectiveStockLimit(m) ?? Infinity));
     if (over) {
       await c.env.DB.prepare('DELETE FROM orders WHERE id = ?').bind(id).run();
       if (useVoucher) await restoreVoucher(c.env.DB, { id, voucher_id: voucher!.id } as OrderRow);
       invalidateOrdersCache();
       const own = normItems.filter((i: any) => i.menuId === over.id).reduce((s: number, i: any) => s + i.quantity, 0);
-      return c.json({ error: stockMessage(over.name, Math.max(0, over.dailyStock - ((after[over.id] || 0) - own))) }, 409);
+      return c.json({ error: stockMessage(over.name, Math.max(0, (effectiveStockLimit(over) ?? 0) - ((after[over.id] || 0) - own))) }, 409);
     }
   }
   await trackOrder(c);
@@ -1226,7 +1254,7 @@ app.post('/api/orders/:id/items', async (c) => {
     }
     itemsToAdd.push({ menuId: menuItem.id, name, price, quantity, notes: ni.notes || '', isAdditional: isPaid, variant });
   }
-  if (itemsToAdd.some((i: any) => menuRows.find((m: any) => m.id === i.menuId)?.dailyStock != null)) {
+  if (itemsToAdd.some((i: any) => { const m = menuRows.find((x: any) => x.id === i.menuId); return !!m && effectiveStockLimit(m) !== null; })) {
     const short = findStockShortage(itemsToAdd, menuRows, await getStockUsed(c.env.DB));
     if (short) return c.json({ error: stockMessage(short.name, short.remaining) }, 409);
   }

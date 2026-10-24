@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS menu (
   is_available INTEGER NOT NULL DEFAULT 1,
   is_best_seller INTEGER NOT NULL DEFAULT 0,
   daily_stock INTEGER,
+  stock_bonus INTEGER NOT NULL DEFAULT 0,
+  stock_bonus_date TEXT,
+  stock_bonus_base INTEGER NOT NULL DEFAULT 0,
   variants TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );

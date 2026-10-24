@@ -7,7 +7,7 @@ import { LOYALTY_DEFAULTS, LoyaltyStatus, Voucher, computeOrderTotals, loyaltyPr
 import { MENUS } from './server/menu-data';
 import { computeQueue, getOrderEta } from './src/utils/estimate';
 import { computeAutoBestSellers } from './src/utils/bestseller';
-import { computeStockUsed, findStockShortage, parseDailyStock, stockMessage, stockRemainingOf } from './src/utils/stock';
+import { computeStockUsed, effectiveStockLimit, findStockShortage, parseDailyStock, parseStockBonus, stockBonusToday, stockMessage, stockRemainingOf, todayKey as stockTodayKey } from './src/utils/stock';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -756,9 +756,9 @@ function menuForClients() {
     const ids = bestSellerCache.ids;
     list = list.map(m => (ids.has(m.id) ? { ...m, isAutoBestSeller: true } : m));
   }
-  if (list.some(m => m.dailyStock != null)) {
+  if (list.some(m => effectiveStockLimit(m) !== null)) {
     const used = computeStockUsed(dbState.orders);
-    list = list.map(m => (m.dailyStock == null ? m : { ...m, stockRemaining: stockRemainingOf(m.dailyStock, used[m.id] || 0) }));
+    list = list.map(m => (effectiveStockLimit(m) === null ? m : { ...m, stockRemaining: stockRemainingOf(effectiveStockLimit(m), used[m.id] || 0) }));
   }
   return list;
 }
@@ -801,8 +801,9 @@ app.post('/api/menu', authMiddleware, requireRole('owner', 'kasir'), (req, res) 
 
 app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, res) => {
   const { id } = req.params;
-  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, variants } = req.body;
+  const { name, category, price, description, imageUrl, isAvailable, isBestSeller, dailyStock, stockBonus, variants } = req.body;
   const stockValue = parseDailyStock(dailyStock);
+  const bonusValue = parseStockBonus(stockBonus);
 
   const itemIndex = dbState.menu.findIndex(m => m.id === id);
 
@@ -816,10 +817,17 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
     const originalKeys = { name: current.name, category: current.category, price: current.price, description: current.description, imageUrl: current.imageUrl, variants: current.variants, isBestSeller: !!current.isBestSeller, dailyStock: current.dailyStock ?? null };
     const changedKeys = { name, category, price, description: price !== undefined ? undefined : description, imageUrl, variants, isBestSeller, dailyStock: stockValue };
     if (Object.entries(changedKeys).some(([k, v]) => v !== undefined && JSON.stringify(v) !== JSON.stringify((originalKeys as any)[k]))) {
-      return res.status(403).json({ error: 'Kasir hanya bisa mengubah status ketersediaan menu' });
+      return res.status(403).json({ error: 'Kasir hanya bisa mengubah ketersediaan menu dan menambah stok darurat hari ini' });
     }
   }
 
+  const previousBonus = stockBonusToday(dbState.menu[itemIndex]);
+  // Menu tanpa batas harian: stok darurat dihitung "mulai sekarang", jadi catat jumlah terjual saat ini
+  let bonusBase = 0;
+  if (bonusValue !== undefined && bonusValue > 0) {
+    const dailyAfter = stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null);
+    if (dailyAfter === null) bonusBase = computeStockUsed(dbState.orders)[id] || 0;
+  }
   dbState.menu[itemIndex] = {
     ...dbState.menu[itemIndex],
     name: name || dbState.menu[itemIndex].name,
@@ -830,9 +838,16 @@ app.put('/api/menu/:id', authMiddleware, requireRole('owner', 'kasir'), (req, re
     isAvailable: isAvailable !== undefined ? isAvailable : dbState.menu[itemIndex].isAvailable,
     isBestSeller: isBestSeller !== undefined ? isBestSeller === true : !!dbState.menu[itemIndex].isBestSeller,
     dailyStock: stockValue !== undefined ? stockValue : (dbState.menu[itemIndex].dailyStock ?? null),
+    stockBonus: bonusValue !== undefined ? bonusValue : dbState.menu[itemIndex].stockBonus,
+    stockBonusDate: bonusValue !== undefined ? stockTodayKey() : dbState.menu[itemIndex].stockBonusDate,
+    stockBonusBase: bonusValue !== undefined ? bonusBase : dbState.menu[itemIndex].stockBonusBase,
     variants: variants !== undefined ? (Array.isArray(variants) && variants.length ? variants : undefined) : dbState.menu[itemIndex].variants
   };
 
+  if (bonusValue !== undefined && previousBonus !== bonusValue) {
+    const actor = ((req as any).user as JwtPayload)?.username || 'staff';
+    logApp('INFO', `Stok darurat hari ini ${dbState.menu[itemIndex].name}: +${previousBonus} -> +${bonusValue} (oleh ${actor})`, { menuId: id, from: previousBonus, to: bonusValue, by: actor });
+  }
   saveDB();
   notifyClientsRefresh();
   res.json({ message: "Menu berhasil diperbarui", item: dbState.menu[itemIndex] });

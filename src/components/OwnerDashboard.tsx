@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { apiFetch } from '../utils/api';
+import { effectiveStockLimit, stockBonusToday } from '../utils/stock';
 import { compressImage } from '../utils/image';
 import { LOYALTY_DEFAULTS } from '../utils/loyalty';
 
@@ -981,9 +982,9 @@ export default function OwnerDashboard({ settings, menu, onLogout, onRefreshData
                               <Flame size={9} /> Best Seller{!item.isBestSeller && ' • Auto'}
                             </span>
                           )}
-                          {item.dailyStock != null && (
-                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? item.dailyStock) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
-                              Sisa {item.stockRemaining ?? item.dailyStock}/{item.dailyStock}
+                          {effectiveStockLimit(item) !== null && (
+                            <span className={`ml-1.5 inline-flex items-center align-middle text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${(item.stockRemaining ?? effectiveStockLimit(item) ?? 0) <= 0 ? 'bg-red-100 text-red-700' : 'bg-sky-100 text-sky-700'}`}>
+                              Sisa {item.stockRemaining ?? effectiveStockLimit(item)}/{effectiveStockLimit(item)}{stockBonusToday(item) > 0 && ` (+${stockBonusToday(item)} hari ini)`}
                             </span>
                           )}
                         </h4>

@@ -1,4 +1,4 @@
-// Stok harian per menu.
+// Stok harian per menu (+ tambahan stok khusus hari ini).
 // Pemakaian stok DIHITUNG dari pesanan hari ini (bukan counter terpisah), sehingga
 // otomatis kembali saat pesanan/item dibatalkan atau dihapus, dan otomatis reset tiap hari.
 // Pesanan yang menunggu verifikasi tetap menahan stok sampai dibatalkan kasir.
@@ -38,6 +38,37 @@ export function computeStockUsed(orders: UsageOrder[], now = Date.now()): Record
 }
 
 // Sisa stok hari ini; null = tidak dibatasi
+// Tanggal hari ini (YYYY-MM-DD) menurut zona waktu cafe
+export function todayKey(now = Date.now()): string {
+  return new Date(now + STOCK_TZ_OFFSET_HOURS * HOUR).toISOString().slice(0, 10);
+}
+
+interface StockLimitFields {
+  dailyStock?: number | null;
+  stockBonus?: number;
+  stockBonusBase?: number;       // untuk menu tanpa batas harian: jumlah terjual saat stok darurat diatur
+  stockBonusDate?: string | null;
+}
+
+// Tambahan stok yang masih berlaku: hanya jika dicatat HARI INI, otomatis hangus besok
+export function stockBonusToday(m: StockLimitFields, now = Date.now()): number {
+  return m.stockBonusDate === todayKey(now) ? Math.max(0, Number(m.stockBonus) || 0) : 0;
+}
+
+// Batas stok yang berlaku hari ini. null = tidak terbatas.
+// - Ada batas harian: batas harian + stok darurat hari ini.
+// - Tanpa batas harian: tidak terbatas, KECUALI kasir memasang stok darurat. Maka menu hanya tersedia
+//   sebanyak stok darurat itu, dihitung dari saat stok darurat diatur (hangus besok -> kembali tidak terbatas).
+export function effectiveStockLimit(m: StockLimitFields, now = Date.now()): number | null {
+  const bonus = stockBonusToday(m, now);
+  if (m.dailyStock === null || m.dailyStock === undefined) {
+    if (bonus <= 0) return null;
+    const base = m.stockBonusDate === todayKey(now) ? Math.max(0, Number(m.stockBonusBase) || 0) : 0;
+    return base + bonus;
+  }
+  return m.dailyStock + bonus;
+}
+
 export function stockRemainingOf(dailyStock: number | null | undefined, used: number): number | null {
   if (dailyStock === null || dailyStock === undefined) return null;
   return Math.max(0, dailyStock - used);
@@ -52,15 +83,16 @@ export function stockMessage(name: string, remaining: number): string {
 // Cek apakah permintaan melebihi stok. Mengembalikan menu pertama yang kurang, atau null jika aman.
 export function findStockShortage(
   requested: { menuId: string; quantity: number }[],
-  menu: { id: string; name: string; dailyStock?: number | null }[],
+  menu: ({ id: string; name: string } & StockLimitFields)[],
   used: Record<string, number>
 ): { name: string; remaining: number } | null {
   const want: Record<string, number> = {};
   for (const r of requested) want[r.menuId] = (want[r.menuId] || 0) + (Number(r.quantity) || 0);
   for (const [menuId, qty] of Object.entries(want)) {
     const m = menu.find(x => x.id === menuId);
-    if (!m || m.dailyStock === null || m.dailyStock === undefined) continue;
-    const remaining = Math.max(0, m.dailyStock - (used[menuId] || 0));
+    const limit = m ? effectiveStockLimit(m) : null;
+    if (!m || limit === null) continue;
+    const remaining = Math.max(0, limit - (used[menuId] || 0));
     if (qty > remaining) return { name: m.name, remaining };
   }
   return null;
@@ -73,4 +105,13 @@ export function parseDailyStock(v: unknown): number | null | undefined {
   const n = Number(v);
   if (!Number.isFinite(n)) return undefined;
   return Math.max(0, Math.floor(n));
+}
+
+// Baca tambahan stok dari input: undefined = tidak dikirim, null/'' = 0 (hapus tambahan), angka >= 0
+export function parseStockBonus(v: unknown): number | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === '') return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(100000, Math.max(0, Math.floor(n)));
 }
